@@ -1,4 +1,6 @@
-# CTF Phasor
+# DAWN
+
+**Discord Attack & Wargame Navigator**
 
 TypeScript와 `discord.js`로 만든 통합 Discord 봇입니다. 서버별로 필요한 기능만
 `/봇 기능 추가`에서 켤 수 있습니다.
@@ -64,8 +66,8 @@ Discord는 `Administrator` 사용자가 모든 애플리케이션 명령을 볼 
 Node.js 22를 권장합니다.
 
 ```bash
-git clone https://github.com/dawneast1009/ctf-phasor.git
-cd ctf-phasor
+git clone https://github.com/dawneast1009/ctf-dawn.git
+cd ctf-dawn
 npm ci
 cp .env.example .env
 npm run check
@@ -120,8 +122,8 @@ CTF 감시는 로그인이나 플래그 제출 없이 공개 읽기 API만 사�
 ## Docker
 
 ```bash
-docker build -t ctf-phasor .
-docker run --env-file .env -v "$PWD/data:/data" ctf-phasor
+docker build -t ctf-dawn .
+docker run --env-file .env -v "$PWD/data:/data" ctf-dawn
 ```
 
 ## 검증

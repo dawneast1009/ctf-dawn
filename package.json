@@ -1,5 +1,5 @@
 {
-  "name": "ctf-phasor",
+  "name": "ctf-dawn",
   "version": "1.0.0",
   "description": "CTF workspace, challenge threads, contribution scoring, and low-impact monitoring for Discord",
   "main": "dist/index.js",
