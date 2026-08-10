@@ -113,6 +113,14 @@ async function handle(i) {
     }
     if (sub === "info" && c)
         return void await i.reply({ embeds: [new discord_js_1.EmbedBuilder().setTitle(c.name).setDescription(`<t:${Math.floor(c.startsAt / 1000)}:f> ~ <t:${Math.floor(c.endsAt / 1000)}:f>\n${(0, store_1.getProblems)(i.guild.id, c.key).length} challenges`)] });
+    if (sub === "edit" && c) {
+        const start = i.options.getString("start"), end = i.options.getString("end");
+        const s = start ? (0, core_1.parseKstDateTime)(start) : c.startsAt, e = end ? (0, core_1.parseKstDateTime)(end) : c.endsAt;
+        if (!s || !e || e <= s)
+            return void await i.reply({ content: "KST 일정을 확인하세요.", flags: discord_js_1.MessageFlags.Ephemeral });
+        (0, store_1.patchContest)(i.guild.id, c.key, { startsAt: s, endsAt: e, teamName: i.options.getString("team") ?? c.teamName });
+        return void await i.reply({ content: "CTF 정보 수정 완료", flags: discord_js_1.MessageFlags.Ephemeral });
+    }
     if (sub === "profile" || sub === "history") {
         const u = sub === "profile" ? i.options.getUser("user") ?? i.user : i.user;
         const rows = (0, store_1.getProblems)(i.guild.id).filter((p) => p.scores[u.id] != null);
