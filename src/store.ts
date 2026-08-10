@@ -14,8 +14,9 @@ export interface CtfContest {
 }
 export interface CtfProblem {
   id: string; guildId: string; ctfName: string; ctfKey: string; name: string;
-  nameKey: string; genre: string; genreKey: string; channelId: string; threadId: string;
-  authorId: string; scores: Record<string, number>; solved: boolean; externalId?: string; createdAt: number;
+  nameKey: string; genre: string; genreKey: string; channelId: string; threadId?: string;
+  cardMessageId?: string; participants?: string[]; authorId: string;
+  scores: Record<string, number>; solved: boolean; externalId?: string; createdAt: number;
 }
 interface Db { contests: Record<string, CtfContest>; problems: Record<string, CtfProblem>; channels: Record<string, string>; }
 const empty = (): Db => ({ contests: {}, problems: {}, channels: {} });
@@ -36,7 +37,7 @@ export function removeContest(guildId: string, key: string) {
 }
 export const getProblems = (guildId: string, key?: string) => Object.values(db.problems).filter((v) => v.guildId === guildId && (!key || v.ctfKey === key));
 export const getProblem = (id: string) => db.problems[id];
-export const getProblemByThread = (id: string) => Object.values(db.problems).find((v) => v.threadId === id);
+export const getProblemByThread = (id: string) => Object.values(db.problems).find((v) => v.threadId != null && v.threadId === id);
 export const findProblem = (guildId: string, key: string, name: string) => getProblems(guildId, key).find((v) => v.nameKey === keyOf(name));
 export function putProblem(value: CtfProblem) { db.problems[value.id] = value; save(); }
 export function patchProblem(id: string, patch: Partial<CtfProblem>) { const value = db.problems[id]; if (!value) return; Object.assign(value, patch); save(); return value; }

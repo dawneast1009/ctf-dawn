@@ -45,7 +45,7 @@ const getProblems = (guildId, key) => Object.values(db.problems).filter((v) => v
 exports.getProblems = getProblems;
 const getProblem = (id) => db.problems[id];
 exports.getProblem = getProblem;
-const getProblemByThread = (id) => Object.values(db.problems).find((v) => v.threadId === id);
+const getProblemByThread = (id) => Object.values(db.problems).find((v) => v.threadId != null && v.threadId === id);
 exports.getProblemByThread = getProblemByThread;
 const findProblem = (guildId, key, name) => (0, exports.getProblems)(guildId, key).find((v) => v.nameKey === (0, exports.keyOf)(name));
 exports.findProblem = findProblem;

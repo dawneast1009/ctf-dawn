@@ -7,7 +7,8 @@
 - `/ctf create`: KST 일정, 참가 역할, 비공개 CTF 카테고리와 기본 채널 생성
 - 공용 `대회-알림` 채널에 일정과 참가 버튼 게시(채널이 없으면 자동 생성)
 - 참가 버튼으로 CTF 역할 지급
-- `/ctf createchallenge category name`: 소문자 장르 채널과 문제 스레드 생성
+- `/ctf createchallenge category name`: 소문자 분야 채널에 문제 카드 생성
+- 문제 카드의 참가 버튼을 처음 누를 때 비공개 스레드를 생성하고 이후 참가자를 같은 스레드에 추가
 - `/ctf solve`: Solver 1점, Contributor 0.5점 기록
 - 분야별 문제를 모두 풀면 채널 표시가 `⬜`에서 `🟦`로 변경되고 새 문제가 추가되면 `⬜`로 복귀
 - `/ctf delete`: 확인 후 현재 CTF 공간, 참가 역할, 문제와 점수 기록 삭제
@@ -33,5 +34,5 @@ npm start
 
 필수 Discord scope는 `bot`, `applications.commands`입니다. 봇에는 View Channels,
 Send Messages, Embed Links, Read Message History, Manage Channels, Manage Roles,
-Create Public Threads, Send Messages in Threads, Manage Threads 권한을 부여합니다.
+Create Private Threads, Send Messages in Threads, Manage Threads 권한을 부여합니다.
 DAWN 역할은 봇이 만드는 `CTF: 대회명` 역할보다 위에 있어야 합니다.
