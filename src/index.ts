@@ -282,6 +282,8 @@ async function submitSolve(i: ButtonInteraction, draftId: string) {
   await refreshChallengeCard(i.guild!, updated);
   const contributors = draft.helpers.length ? draft.helpers.map((userId) => `<@${userId}>`).join(", ") : "없음";
   const solveEmbed = new EmbedBuilder().setTitle("🎉 Challenge solved!").setColor(0xff9f1c).setDescription(`**${problem.name}** [${problem.genre}]\n\n**Flag found by:** <@${draft.solver}>\n**Contributors:** ${contributors}\n**Flag submitter:** <@${draft.ownerId}>\n**Submitted flag:** ${inlineCode(draft.flag)}`).setTimestamp();
+  const solverMember = await i.guild!.members.fetch(draft.solver).catch(() => null);
+  if (solverMember) solveEmbed.setThumbnail(solverMember.displayAvatarURL({ size: 256 }));
   const thread = updated.threadId ? await i.guild!.channels.fetch(updated.threadId).catch(() => null) : null;
   if (thread?.isThread()) await thread.send({ embeds: [solveEmbed] });
   const contest = getContest(i.guild!.id, problem.ctfKey);
@@ -292,7 +294,16 @@ async function submitSolve(i: ButtonInteraction, draftId: string) {
   await i.update({ content: "Solve 기록 완료", embeds: [], components: [] });
 }
 async function button(i: ButtonInteraction) {
-  if (i.customId.startsWith("join:") && i.guild) { const c = getContest(i.guild.id, i.customId.slice(5)); await (i.member as GuildMember).roles.add(c.roleId); return void await i.reply({ content: "참가 완료", flags: MessageFlags.Ephemeral }); }
+  if (i.customId.startsWith("join:") && i.guild) {
+    const contest = getContest(i.guild.id, i.customId.slice(5));
+    if (!contest) return void await i.reply({ content: "삭제되었거나 만료된 대회입니다.", flags: MessageFlags.Ephemeral });
+    const member = i.member as GuildMember;
+    if (member.roles.cache.has(contest.roleId)) return void await i.reply({ content: "이미 참가 중입니다.", flags: MessageFlags.Ephemeral });
+    await member.roles.add(contest.roleId);
+    const general = await channel(i.guild, contest, "general", "general");
+    await general.send({ content: `<@${i.user.id}> 님이 참가했어 ⚔️`, allowedMentions: { users: [i.user.id] } });
+    return void await i.reply({ content: "참가 완료", flags: MessageFlags.Ephemeral });
+  }
   if (i.customId.startsWith("challenge-open:") && i.guild) { const problem = getProblem(i.customId.slice(15)); if (!problem) return void await i.reply({ content: "삭제된 문제입니다.", flags: MessageFlags.Ephemeral }); await i.deferReply({ flags: MessageFlags.Ephemeral }); try { const thread = await ensureChallengeThread(i.guild, problem.id); if (thread.archived) await thread.setArchived(false); await thread.members.add(i.user.id); const latest = getProblem(problem.id)!; if (!(latest.participants ?? []).includes(i.user.id)) patchProblem(problem.id, { participants: [...(latest.participants ?? []), i.user.id] }); await refreshChallengeCard(i.guild, getProblem(problem.id)!); return void await i.editReply(`<#${thread.id}> 스레드로 이동하세요.`); } catch (error) { return void await i.editReply(`스레드 생성 실패: ${error instanceof Error ? error.message : "알 수 없는 오류"}`); } }
   if (i.customId.startsWith("solve-flag:")) { const draftId = i.customId.slice(11), draft = activeSolveDraft(draftId, i.user.id); if (!draft) return void await i.update({ content: "Solve 입력이 만료되었습니다.", embeds: [], components: [] }); const input = new TextInputBuilder().setCustomId("flag").setLabel("Flag").setPlaceholder("flag{...}").setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(1000); if (draft.flag) input.setValue(draft.flag); return void await i.showModal(new ModalBuilder().setCustomId(`solve-flag:${draftId}`).setTitle("Flag 입력").addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(input))); }
   if (i.customId.startsWith("solve-change:")) { const draftId = i.customId.slice(13), draft = activeSolveDraft(draftId, i.user.id), problem = draft && getProblem(draft.problemId); if (!draft || !problem) return void await i.update({ content: "Solve 입력이 만료되었습니다.", embeds: [], components: [] }); return void await i.update(solveDraftPayload(draftId, draft, problem, true)); }

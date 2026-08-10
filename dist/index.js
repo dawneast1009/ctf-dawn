@@ -477,6 +477,9 @@ async function submitSolve(i, draftId) {
     await refreshChallengeCard(i.guild, updated);
     const contributors = draft.helpers.length ? draft.helpers.map((userId) => `<@${userId}>`).join(", ") : "없음";
     const solveEmbed = new discord_js_1.EmbedBuilder().setTitle("🎉 Challenge solved!").setColor(0xff9f1c).setDescription(`**${problem.name}** [${problem.genre}]\n\n**Flag found by:** <@${draft.solver}>\n**Contributors:** ${contributors}\n**Flag submitter:** <@${draft.ownerId}>\n**Submitted flag:** ${(0, discord_js_1.inlineCode)(draft.flag)}`).setTimestamp();
+    const solverMember = await i.guild.members.fetch(draft.solver).catch(() => null);
+    if (solverMember)
+        solveEmbed.setThumbnail(solverMember.displayAvatarURL({ size: 256 }));
     const thread = updated.threadId ? await i.guild.channels.fetch(updated.threadId).catch(() => null) : null;
     if (thread?.isThread())
         await thread.send({ embeds: [solveEmbed] });
@@ -489,8 +492,15 @@ async function submitSolve(i, draftId) {
 }
 async function button(i) {
     if (i.customId.startsWith("join:") && i.guild) {
-        const c = (0, store_1.getContest)(i.guild.id, i.customId.slice(5));
-        await i.member.roles.add(c.roleId);
+        const contest = (0, store_1.getContest)(i.guild.id, i.customId.slice(5));
+        if (!contest)
+            return void await i.reply({ content: "삭제되었거나 만료된 대회입니다.", flags: discord_js_1.MessageFlags.Ephemeral });
+        const member = i.member;
+        if (member.roles.cache.has(contest.roleId))
+            return void await i.reply({ content: "이미 참가 중입니다.", flags: discord_js_1.MessageFlags.Ephemeral });
+        await member.roles.add(contest.roleId);
+        const general = await channel(i.guild, contest, "general", "general");
+        await general.send({ content: `<@${i.user.id}> 님이 참가했어 ⚔️`, allowedMentions: { users: [i.user.id] } });
         return void await i.reply({ content: "참가 완료", flags: discord_js_1.MessageFlags.Ephemeral });
     }
     if (i.customId.startsWith("challenge-open:") && i.guild) {
