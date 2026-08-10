@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { isAllSolved, normalizeCtfCategory, parseKstDateTime } from "../src/ctf/core";
+import { categoryChannelName, isAllSolved, normalizeCtfCategory, parseKstDateTime } from "../src/ctf/core";
 
 test("CTF 문제 분야를 소문자 채널명으로 정규화한다", () => {
   assert.equal(normalizeCtfCategory(" Web Exploit "), "web-exploit");
@@ -17,4 +17,10 @@ test("추가된 미해결 문제가 있으면 All Solve를 해제한다", () => 
   assert.equal(isAllSolved([{ solved: true }, { solved: true }] as any), true);
   assert.equal(isAllSolved([{ solved: true }, { solved: false }] as any), false);
   assert.equal(isAllSolved([]), false);
+});
+
+test("분야 채널은 전부 풀렸을 때만 파란색이다", () => {
+  assert.equal(categoryChannelName("rev", [{ solved: false }]), "⬜｜rev");
+  assert.equal(categoryChannelName("rev", [{ solved: true }, { solved: true }]), "🟦｜rev");
+  assert.equal(categoryChannelName("rev", []), "⬜｜rev");
 });

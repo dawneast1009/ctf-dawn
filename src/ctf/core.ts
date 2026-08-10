@@ -33,3 +33,7 @@ export function parseKstDateTime(input: string): number | null {
 export function isAllSolved(problems: Pick<CtfProblem, "solved">[]): boolean {
   return problems.length > 0 && problems.every((problem) => problem.solved);
 }
+
+export function categoryChannelName(category: string, problems: Pick<CtfProblem, "solved">[]): string {
+  return `${isAllSolved(problems) ? "🟦" : "⬜"}｜${category}`;
+}

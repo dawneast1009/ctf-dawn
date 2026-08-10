@@ -3,6 +3,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.getChannel = exports.findProblem = exports.getProblemByThread = exports.getProblem = exports.getProblems = exports.getContests = exports.getContest = exports.keyOf = void 0;
 exports.putContest = putContest;
 exports.patchContest = patchContest;
+exports.removeContest = removeContest;
 exports.putProblem = putProblem;
 exports.patchProblem = patchProblem;
 exports.removeProblem = removeProblem;
@@ -29,6 +30,17 @@ exports.getContests = getContests;
 function putContest(value) { db.contests[contestKey(value.guildId, value.key)] = value; save(); }
 function patchContest(guildId, key, patch) { const value = (0, exports.getContest)(guildId, key); if (!value)
     return; Object.assign(value, patch, { updatedAt: Date.now() }); save(); return value; }
+function removeContest(guildId, key) {
+    delete db.contests[contestKey(guildId, key)];
+    for (const [id, problem] of Object.entries(db.problems))
+        if (problem.guildId === guildId && problem.ctfKey === key)
+            delete db.problems[id];
+    const channelPrefix = `${guildId}:${key}:`;
+    for (const channelKey of Object.keys(db.channels))
+        if (channelKey.startsWith(channelPrefix))
+            delete db.channels[channelKey];
+    save();
+}
 const getProblems = (guildId, key) => Object.values(db.problems).filter((v) => v.guildId === guildId && (!key || v.ctfKey === key));
 exports.getProblems = getProblems;
 const getProblem = (id) => db.problems[id];

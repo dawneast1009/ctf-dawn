@@ -26,6 +26,13 @@ export const getContest = (guildId: string, key: string) => db.contests[contestK
 export const getContests = (guildId: string) => Object.values(db.contests).filter((v) => v.guildId === guildId);
 export function putContest(value: CtfContest) { db.contests[contestKey(value.guildId, value.key)] = value; save(); }
 export function patchContest(guildId: string, key: string, patch: Partial<CtfContest>) { const value = getContest(guildId, key); if (!value) return; Object.assign(value, patch, { updatedAt: Date.now() }); save(); return value; }
+export function removeContest(guildId: string, key: string) {
+  delete db.contests[contestKey(guildId, key)];
+  for (const [id, problem] of Object.entries(db.problems)) if (problem.guildId === guildId && problem.ctfKey === key) delete db.problems[id];
+  const channelPrefix = `${guildId}:${key}:`;
+  for (const channelKey of Object.keys(db.channels)) if (channelKey.startsWith(channelPrefix)) delete db.channels[channelKey];
+  save();
+}
 export const getProblems = (guildId: string, key?: string) => Object.values(db.problems).filter((v) => v.guildId === guildId && (!key || v.ctfKey === key));
 export const getProblem = (id: string) => db.problems[id];
 export const getProblemByThread = (id: string) => Object.values(db.problems).find((v) => v.threadId === id);
