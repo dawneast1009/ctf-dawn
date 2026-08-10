@@ -12,10 +12,11 @@ if (!token)
 const ownerId = process.env.BOT_OWNER_ID?.trim();
 const guildIds = (process.env.GUILD_IDS ?? "").split(",").map((v) => v.trim()).filter(Boolean);
 const client = new discord_js_1.Client({ intents: [discord_js_1.GatewayIntentBits.Guilds] });
-const drafts = new Map();
+const solveDrafts = new Map();
 const deleteDrafts = new Map();
 const pullDrafts = new Map();
 const threadOpenings = new Map();
+const legacyStatusCleaned = new Set();
 const id = () => `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`;
 const adminSubs = new Set(["create", "createchallenge", "edit", "delete", "deletechallenge", "addpoint", "deletepoint", "pull", "warning", "defaultsettings"]);
 const command = new discord_js_1.SlashCommandBuilder().setName("ctf").setDescription("DAWN CTF workspace")
@@ -81,9 +82,9 @@ async function deleteContestWorkspace(guild, contest) {
         await role.delete().catch(() => failures.push("참가 역할"));
     if (failures.length)
         throw new Error(`삭제하지 못한 항목: ${failures.join(", ")}`);
-    for (const [userId, draft] of drafts)
+    for (const [draftId, draft] of solveDrafts)
         if ((0, store_1.getProblem)(draft.problemId)?.ctfKey === contest.key)
-            drafts.delete(userId);
+            solveDrafts.delete(draftId);
     (0, store_1.removeContest)(guild.id, contest.key);
 }
 async function workspace(guild, name, startsAt, endsAt, teamName) {
@@ -131,6 +132,37 @@ function challengeCardPayload(problem) {
         button.setEmoji("👋");
     return { embeds: [embed], components: [new discord_js_1.ActionRowBuilder().addComponents(button)] };
 }
+function solveDraftPayload(draftId, draft, problem, solverPicker = false, content) {
+    const contributors = draft.helpers.length ? draft.helpers.map((userId) => `<@${userId}>`).join(", ") : "없음";
+    const embed = new discord_js_1.EmbedBuilder()
+        .setTitle(`🔧 ${problem.name} — Solve`)
+        .setColor(0x00c9a7)
+        .setDescription(`**Main Solver:** <@${draft.solver}>\n**Contributors:** ${contributors}\n**Flag:** ${draft.flag ? (0, discord_js_1.inlineCode)(draft.flag) : "미입력"}`);
+    if (solverPicker) {
+        return {
+            content: content ?? "메인 Solver를 선택하세요.",
+            embeds: [embed],
+            components: [new discord_js_1.ActionRowBuilder().addComponents(new discord_js_1.UserSelectMenuBuilder().setCustomId(`solve-solver:${draftId}`).setPlaceholder("Main Solver 선택").setMinValues(1).setMaxValues(1).setDefaultUsers(draft.solver))],
+        };
+    }
+    const contributorsSelect = new discord_js_1.UserSelectMenuBuilder().setCustomId(`solve-helpers:${draftId}`).setPlaceholder("같이 푼 사람 선택").setMinValues(0).setMaxValues(10);
+    if (draft.helpers.length)
+        contributorsSelect.setDefaultUsers(...draft.helpers);
+    return {
+        content: content ?? "같이 푼 사람 선택",
+        embeds: [embed],
+        components: [
+            new discord_js_1.ActionRowBuilder().addComponents(contributorsSelect),
+            new discord_js_1.ActionRowBuilder().addComponents(new discord_js_1.ButtonBuilder().setCustomId(`solve-flag:${draftId}`).setLabel("Flag 입력").setEmoji("🚩").setStyle(discord_js_1.ButtonStyle.Secondary), new discord_js_1.ButtonBuilder().setCustomId(`solve-change:${draftId}`).setLabel("Solver 변경").setEmoji("🧍").setStyle(discord_js_1.ButtonStyle.Secondary), new discord_js_1.ButtonBuilder().setCustomId(`solve-submit:${draftId}`).setLabel("Submit").setEmoji("📥").setStyle(discord_js_1.ButtonStyle.Success)),
+        ],
+    };
+}
+function activeSolveDraft(draftId, userId) {
+    const draft = solveDrafts.get(draftId);
+    if (!draft || draft.ownerId !== userId || Date.now() - draft.createdAt > 10 * 60_000)
+        return null;
+    return draft;
+}
 async function ensureChallengeCard(guild, problem) {
     const genreChannel = await guild.channels.fetch(problem.channelId).catch(() => null);
     if (genreChannel?.type !== discord_js_1.ChannelType.GuildText)
@@ -148,6 +180,12 @@ async function refreshChallengeCard(guild, problem) {
     const latest = (0, store_1.getProblem)(problem.id) ?? problem;
     const card = await ensureChallengeCard(guild, latest);
     await card.edit(challengeCardPayload(latest));
+    if (latest.threadId) {
+        const thread = await guild.channels.fetch(latest.threadId).catch(() => null);
+        const expected = `${latest.solved ? "✅" : "❌"}｜${latest.name}`.slice(0, 100);
+        if (thread?.isThread() && thread.name !== expected)
+            await thread.setName(expected);
+    }
 }
 async function ensureChallengeThread(guild, problemId) {
     const running = threadOpenings.get(problemId);
@@ -165,7 +203,7 @@ async function ensureChallengeThread(guild, problemId) {
         const genreChannel = await guild.channels.fetch(problem.channelId).catch(() => null);
         if (genreChannel?.type !== discord_js_1.ChannelType.GuildText)
             throw new Error("문제 분야 채널을 찾을 수 없습니다.");
-        const thread = await genreChannel.threads.create({ name: problem.name.slice(0, 100), type: discord_js_1.ChannelType.PrivateThread, invitable: true, autoArchiveDuration: discord_js_1.ThreadAutoArchiveDuration.OneWeek });
+        const thread = await genreChannel.threads.create({ name: `❌｜${problem.name}`.slice(0, 100), type: discord_js_1.ChannelType.PrivateThread, invitable: true, autoArchiveDuration: discord_js_1.ThreadAutoArchiveDuration.OneWeek });
         (0, store_1.patchProblem)(problem.id, { threadId: thread.id });
         await thread.send(`**${problem.name}** · ${problem.genre}\n이 스레드에서 \`/ctf solve\`를 사용하세요.`);
         return thread;
@@ -180,9 +218,71 @@ async function ensureChallengeThread(guild, problemId) {
 }
 async function ensureChallengeCards(guild, contest) {
     for (const problem of (0, store_1.getProblems)(guild.id, contest.key))
-        await ensureChallengeCard(guild, problem);
+        await refreshChallengeCard(guild, problem);
 }
-async function status(guild, c) { const ps = (0, store_1.getProblems)(guild.id, c.key); const all = (0, core_1.isAllSolved)(ps); (0, store_1.patchContest)(guild.id, c.key, { allSolved: all }); await syncCategoryChannels(guild, c); const ch = await channel(guild, c, "solve", "📃｜solve"); await ch.send({ embeds: [new discord_js_1.EmbedBuilder().setTitle(all ? `🔵 ALL SOLVE · ${c.name}` : `⚪ ${c.name}`).setColor(all ? 0x3498db : 0xffffff).setDescription(`${ps.filter((p) => p.solved).length}/${ps.length} solved`)] }); }
+function categorySummaryEmbed(category, problems) {
+    const solved = problems.filter((problem) => problem.solved);
+    const lines = problems.map((problem) => {
+        if (!problem.solved)
+            return `⬜ ${problem.name}`;
+        const solver = Object.entries(problem.scores).find(([, score]) => score >= 1)?.[0];
+        return `✅ ${problem.name}${solver ? ` — solved by <@${solver}>` : ""}`;
+    });
+    let body = "";
+    for (const line of lines) {
+        if (body.length + line.length > 3700) {
+            body += "\n…";
+            break;
+        }
+        body += `${body ? "\n" : ""}${line}`;
+    }
+    const allSolved = (0, core_1.isAllSolved)(problems);
+    const title = category.charAt(0).toUpperCase() + category.slice(1);
+    return new discord_js_1.EmbedBuilder().setTitle(`${allSolved ? "🟦" : "⬜"} ${title}`).setColor(allSolved ? 0x3498db : 0xffffff).setDescription(`${body || "등록된 문제 없음"}\n\n**${solved.length}/${problems.length} solved**`);
+}
+async function cleanupLegacyStatus(guild, contest, solveChannel) {
+    const cleanupKey = `${guild.id}:${contest.key}`;
+    if (legacyStatusCleaned.has(cleanupKey))
+        return;
+    legacyStatusCleaned.add(cleanupKey);
+    const messages = await solveChannel.messages.fetch({ limit: 100 }).catch(() => null);
+    if (!messages)
+        return;
+    for (const message of messages.values()) {
+        const title = message.embeds[0]?.title ?? "";
+        if (message.author.id === client.user.id && (title === `⚪ ${contest.name}` || title === `🔵 ALL SOLVE · ${contest.name}`))
+            await message.delete().catch(() => undefined);
+    }
+}
+async function status(guild, contest) {
+    const problems = (0, store_1.getProblems)(guild.id, contest.key);
+    (0, store_1.patchContest)(guild.id, contest.key, { allSolved: (0, core_1.isAllSolved)(problems) });
+    await syncCategoryChannels(guild, contest);
+    const solveChannel = await channel(guild, contest, "solve", "📃｜solve");
+    await cleanupLegacyStatus(guild, contest, solveChannel);
+    const announceChannel = await channel(guild, contest, "announce", "📣｜announce");
+    const byCategory = new Map();
+    for (const problem of problems)
+        byCategory.set(problem.genreKey, [...(byCategory.get(problem.genreKey) ?? []), problem]);
+    const activeSummaryKeys = new Set([...byCategory.keys()].map((category) => `${contest.key}:summary:${category}`));
+    for (const saved of (0, store_1.getMessages)(guild.id, `${contest.key}:summary:`))
+        if (!activeSummaryKeys.has(saved.key)) {
+            await announceChannel.messages.delete(saved.id).catch(() => undefined);
+            (0, store_1.removeMessage)(guild.id, saved.key);
+        }
+    for (const [category, categoryProblems] of byCategory) {
+        const messageKey = `${contest.key}:summary:${category}`;
+        const saved = (0, store_1.getMessage)(guild.id, messageKey);
+        const old = saved ? await announceChannel.messages.fetch(saved).catch(() => null) : null;
+        const payload = { embeds: [categorySummaryEmbed(category, categoryProblems)] };
+        if (old)
+            await old.edit(payload);
+        else {
+            const message = await announceChannel.send(payload);
+            (0, store_1.putMessage)(guild.id, messageKey, message.id);
+        }
+    }
+}
 async function challenge(guild, c, category, name, externalId, updateStatus = true) { if ((0, store_1.findProblem)(guild.id, c.key, name))
     return; const genre = (0, core_1.normalizeCtfCategory)(category); const ch = await channel(guild, c, `genre:${genre}`, `⬜｜${genre}`); const problem = { id: id(), guildId: guild.id, ctfName: c.name, ctfKey: c.key, name, nameKey: (0, store_1.keyOf)(name), genre, genreKey: genre, channelId: ch.id, authorId: client.user.id, participants: [], scores: {}, solved: false, externalId, createdAt: Date.now() }; (0, store_1.putProblem)(problem); try {
     await ensureChallengeCard(guild, problem);
@@ -196,9 +296,9 @@ client.once(discord_js_1.Events.ClientReady, async () => { for (const g of clien
     if (!guildIds.length || guildIds.includes(g.id)) {
         await g.commands.set([command.toJSON()]);
         for (const c of (0, store_1.getContests)(g.id)) {
-            await syncCategoryChannels(g, c);
             await ensureContestAnnouncement(g, c);
             await ensureChallengeCards(g, c);
+            await status(g, c);
         }
     } console.log(`DAWN online: ${client.user.tag}`); });
 client.on(discord_js_1.Events.InteractionCreate, async (i) => { try {
@@ -208,16 +308,10 @@ client.on(discord_js_1.Events.InteractionCreate, async (i) => { try {
         await button(i);
     else if (i.isModalSubmit() && i.customId.startsWith("ctf-pull:"))
         await pullModal(i);
-    else if (i.isUserSelectMenu()) {
-        const d = drafts.get(i.user.id);
-        if (d) {
-            if (i.customId === "solver")
-                d.solver = i.values[0];
-            else
-                d.helpers = i.values;
-        }
-        await i.deferUpdate();
-    }
+    else if (i.isModalSubmit() && i.customId.startsWith("solve-flag:"))
+        await solveFlagModal(i);
+    else if (i.isUserSelectMenu() && (i.customId.startsWith("solve-helpers:") || i.customId.startsWith("solve-solver:")))
+        await solveSelect(i);
     else if (i.isStringSelectMenu())
         await select(i.customId, i.values[0], i);
 }
@@ -252,8 +346,9 @@ async function handle(i) {
         const p = (0, store_1.getProblemByThread)(i.channelId);
         if (!p || p.solved)
             return void await i.reply({ content: p ? "이미 풀린 문제입니다." : "문제 스레드에서 실행하세요.", flags: discord_js_1.MessageFlags.Ephemeral });
-        drafts.set(i.user.id, { problemId: p.id, solver: i.user.id, helpers: [] });
-        return void await i.reply({ content: "푼 사람과 기여자를 선택하세요.", components: [new discord_js_1.ActionRowBuilder().addComponents(new discord_js_1.UserSelectMenuBuilder().setCustomId("solver").setPlaceholder("푼 사람").setMinValues(1).setMaxValues(1)), new discord_js_1.ActionRowBuilder().addComponents(new discord_js_1.UserSelectMenuBuilder().setCustomId("helpers").setPlaceholder("기여자 (선택)").setMinValues(0).setMaxValues(10)), new discord_js_1.ActionRowBuilder().addComponents(new discord_js_1.ButtonBuilder().setCustomId("solve-confirm").setLabel("기록").setStyle(discord_js_1.ButtonStyle.Success))], flags: discord_js_1.MessageFlags.Ephemeral });
+        const draftId = id(), draft = { problemId: p.id, ownerId: i.user.id, solver: i.user.id, helpers: [], createdAt: Date.now() };
+        solveDrafts.set(draftId, draft);
+        return void await i.reply({ ...solveDraftPayload(draftId, draft, p), flags: discord_js_1.MessageFlags.Ephemeral });
     }
     if (sub === "delete") {
         if (!c)
@@ -337,63 +432,122 @@ async function pullModal(i) { const pullId = i.customId.slice(9), draft = pullDr
 catch (error) {
     return void await i.editReply(`Pull 실패: ${error instanceof Error ? error.message : "알 수 없는 오류"}`);
 } }
-async function button(i) { if (i.customId.startsWith("join:") && i.guild) {
-    const c = (0, store_1.getContest)(i.guild.id, i.customId.slice(5));
-    await i.member.roles.add(c.roleId);
-    return void await i.reply({ content: "참가 완료", flags: discord_js_1.MessageFlags.Ephemeral });
-} if (i.customId.startsWith("challenge-open:") && i.guild) {
-    const problem = (0, store_1.getProblem)(i.customId.slice(15));
-    if (!problem)
-        return void await i.reply({ content: "삭제된 문제입니다.", flags: discord_js_1.MessageFlags.Ephemeral });
-    await i.deferReply({ flags: discord_js_1.MessageFlags.Ephemeral });
-    try {
-        const thread = await ensureChallengeThread(i.guild, problem.id);
-        if (thread.archived)
-            await thread.setArchived(false);
-        await thread.members.add(i.user.id);
-        const latest = (0, store_1.getProblem)(problem.id);
-        if (!(latest.participants ?? []).includes(i.user.id))
-            (0, store_1.patchProblem)(problem.id, { participants: [...(latest.participants ?? []), i.user.id] });
-        await refreshChallengeCard(i.guild, (0, store_1.getProblem)(problem.id));
-        return void await i.editReply(`<#${thread.id}> 스레드로 이동하세요.`);
+async function solveSelect(i) {
+    const solverMode = i.customId.startsWith("solve-solver:");
+    const draftId = i.customId.slice(solverMode ? 13 : 14);
+    const draft = activeSolveDraft(draftId, i.user.id);
+    const problem = draft && (0, store_1.getProblem)(draft.problemId);
+    if (!draft || !problem)
+        return void await i.update({ content: "Solve 입력이 만료되었습니다. `/ctf solve`를 다시 실행하세요.", embeds: [], components: [] });
+    if (solverMode) {
+        draft.solver = i.values[0];
+        draft.helpers = draft.helpers.filter((userId) => userId !== draft.solver);
     }
-    catch (error) {
-        return void await i.editReply(`스레드 생성 실패: ${error instanceof Error ? error.message : "알 수 없는 오류"}`);
+    else
+        draft.helpers = i.values.filter((userId) => userId !== draft.solver);
+    await i.update(solveDraftPayload(draftId, draft, problem));
+}
+async function solveFlagModal(i) {
+    const draftId = i.customId.slice(11);
+    const draft = activeSolveDraft(draftId, i.user.id);
+    const problem = draft && (0, store_1.getProblem)(draft.problemId);
+    if (!draft || !problem)
+        return void await i.reply({ content: "Solve 입력이 만료되었습니다. `/ctf solve`를 다시 실행하세요.", flags: discord_js_1.MessageFlags.Ephemeral });
+    draft.flag = i.fields.getTextInputValue("flag").trim();
+    if (i.isFromMessage())
+        await i.update(solveDraftPayload(draftId, draft, problem));
+    else
+        await i.reply({ ...solveDraftPayload(draftId, draft, problem), flags: discord_js_1.MessageFlags.Ephemeral });
+}
+async function submitSolve(i, draftId) {
+    const draft = activeSolveDraft(draftId, i.user.id);
+    const problem = draft && (0, store_1.getProblem)(draft.problemId);
+    if (!draft || !problem)
+        return void await i.update({ content: "Solve 입력이 만료되었습니다. `/ctf solve`를 다시 실행하세요.", embeds: [], components: [] });
+    if (problem.solved)
+        return void await i.update({ content: "이미 풀린 문제입니다.", embeds: [], components: [] });
+    if (!draft.flag)
+        return void await i.update(solveDraftPayload(draftId, draft, problem, false, "먼저 Flag를 입력하세요."));
+    const scores = { [draft.solver]: 1 };
+    for (const helper of draft.helpers)
+        if (helper !== draft.solver)
+            scores[helper] = 0.5;
+    (0, store_1.patchProblem)(problem.id, { scores, solved: true, submittedFlag: draft.flag });
+    const updated = (0, store_1.getProblem)(problem.id);
+    await refreshChallengeCard(i.guild, updated);
+    const contributors = draft.helpers.length ? draft.helpers.map((userId) => `<@${userId}>`).join(", ") : "없음";
+    const solveEmbed = new discord_js_1.EmbedBuilder().setTitle("🎉 Challenge solved!").setColor(0xff9f1c).setDescription(`**${problem.name}** [${problem.genre}]\n\n**Flag found by:** <@${draft.solver}>\n**Contributors:** ${contributors}\n**Flag submitter:** <@${draft.ownerId}>\n**Submitted flag:** ${(0, discord_js_1.inlineCode)(draft.flag)}`).setTimestamp();
+    const thread = updated.threadId ? await i.guild.channels.fetch(updated.threadId).catch(() => null) : null;
+    if (thread?.isThread())
+        await thread.send({ embeds: [solveEmbed] });
+    const contest = (0, store_1.getContest)(i.guild.id, problem.ctfKey);
+    const solveChannel = await channel(i.guild, contest, "solve", "📃｜solve");
+    await solveChannel.send({ content: `<@&${contest.roleId}>`, embeds: [solveEmbed], allowedMentions: { roles: [contest.roleId] } });
+    await status(i.guild, contest);
+    solveDrafts.delete(draftId);
+    await i.update({ content: "Solve 기록 완료", embeds: [], components: [] });
+}
+async function button(i) {
+    if (i.customId.startsWith("join:") && i.guild) {
+        const c = (0, store_1.getContest)(i.guild.id, i.customId.slice(5));
+        await i.member.roles.add(c.roleId);
+        return void await i.reply({ content: "참가 완료", flags: discord_js_1.MessageFlags.Ephemeral });
     }
-} if (i.customId.startsWith("delete-contest:") && i.guild) {
-    const confirmationId = i.customId.slice(15), draft = deleteDrafts.get(confirmationId);
-    if (!draft || draft.guildId !== i.guild.id || draft.userId !== i.user.id || Date.now() - draft.createdAt > 300_000)
-        return void await i.update({ content: "삭제 확인이 만료되었습니다. `/ctf delete`를 다시 실행하세요.", components: [] });
-    const c = (0, store_1.getContest)(i.guild.id, draft.ctfKey);
-    deleteDrafts.delete(confirmationId);
-    if (!c)
-        return void await i.update({ content: "이미 삭제된 CTF입니다.", components: [] });
-    await i.update({ content: `**${c.name}** 삭제 중...`, components: [] });
-    try {
-        await deleteContestWorkspace(i.guild, c);
-        await i.editReply({ content: `**${c.name}** 삭제 완료`, components: [] });
+    if (i.customId.startsWith("challenge-open:") && i.guild) {
+        const problem = (0, store_1.getProblem)(i.customId.slice(15));
+        if (!problem)
+            return void await i.reply({ content: "삭제된 문제입니다.", flags: discord_js_1.MessageFlags.Ephemeral });
+        await i.deferReply({ flags: discord_js_1.MessageFlags.Ephemeral });
+        try {
+            const thread = await ensureChallengeThread(i.guild, problem.id);
+            if (thread.archived)
+                await thread.setArchived(false);
+            await thread.members.add(i.user.id);
+            const latest = (0, store_1.getProblem)(problem.id);
+            if (!(latest.participants ?? []).includes(i.user.id))
+                (0, store_1.patchProblem)(problem.id, { participants: [...(latest.participants ?? []), i.user.id] });
+            await refreshChallengeCard(i.guild, (0, store_1.getProblem)(problem.id));
+            return void await i.editReply(`<#${thread.id}> 스레드로 이동하세요.`);
+        }
+        catch (error) {
+            return void await i.editReply(`스레드 생성 실패: ${error instanceof Error ? error.message : "알 수 없는 오류"}`);
+        }
     }
-    catch (error) {
-        await i.editReply({ content: `삭제가 일부 완료되지 않았습니다: ${error instanceof Error ? error.message : "알 수 없는 오류"}`, components: [] });
+    if (i.customId.startsWith("solve-flag:")) {
+        const draftId = i.customId.slice(11), draft = activeSolveDraft(draftId, i.user.id);
+        if (!draft)
+            return void await i.update({ content: "Solve 입력이 만료되었습니다.", embeds: [], components: [] });
+        const input = new discord_js_1.TextInputBuilder().setCustomId("flag").setLabel("Flag").setPlaceholder("flag{...}").setStyle(discord_js_1.TextInputStyle.Short).setRequired(true).setMaxLength(1000);
+        if (draft.flag)
+            input.setValue(draft.flag);
+        return void await i.showModal(new discord_js_1.ModalBuilder().setCustomId(`solve-flag:${draftId}`).setTitle("Flag 입력").addComponents(new discord_js_1.ActionRowBuilder().addComponents(input)));
     }
-    return;
-} if (i.customId === "solve-confirm" && i.guild) {
-    const d = drafts.get(i.user.id), p = d && (0, store_1.getProblem)(d.problemId);
-    if (!d || !p)
-        return;
-    const scores = { [d.solver]: 1 };
-    for (const h of d.helpers)
-        if (h !== d.solver)
-            scores[h] = .5;
-    (0, store_1.patchProblem)(p.id, { scores, solved: true });
-    const t = p.threadId ? await i.guild.channels.fetch(p.threadId).catch(() => null) : null;
-    if (t?.isThread())
-        await t.setName(`✅｜${p.name}`);
-    await refreshChallengeCard(i.guild, (0, store_1.getProblem)(p.id));
-    await status(i.guild, (0, store_1.getContest)(i.guild.id, p.ctfKey));
-    drafts.delete(i.user.id);
-    return void await i.update({ content: "기록 완료", components: [] });
-} }
+    if (i.customId.startsWith("solve-change:")) {
+        const draftId = i.customId.slice(13), draft = activeSolveDraft(draftId, i.user.id), problem = draft && (0, store_1.getProblem)(draft.problemId);
+        if (!draft || !problem)
+            return void await i.update({ content: "Solve 입력이 만료되었습니다.", embeds: [], components: [] });
+        return void await i.update(solveDraftPayload(draftId, draft, problem, true));
+    }
+    if (i.customId.startsWith("solve-submit:"))
+        return submitSolve(i, i.customId.slice(13));
+    if (i.customId.startsWith("delete-contest:") && i.guild) {
+        const confirmationId = i.customId.slice(15), draft = deleteDrafts.get(confirmationId);
+        if (!draft || draft.guildId !== i.guild.id || draft.userId !== i.user.id || Date.now() - draft.createdAt > 300_000)
+            return void await i.update({ content: "삭제 확인이 만료되었습니다. `/ctf delete`를 다시 실행하세요.", components: [] });
+        const c = (0, store_1.getContest)(i.guild.id, draft.ctfKey);
+        deleteDrafts.delete(confirmationId);
+        if (!c)
+            return void await i.update({ content: "이미 삭제된 CTF입니다.", components: [] });
+        await i.update({ content: `**${c.name}** 삭제 중...`, components: [] });
+        try {
+            await deleteContestWorkspace(i.guild, c);
+            await i.editReply({ content: `**${c.name}** 삭제 완료`, components: [] });
+        }
+        catch (error) {
+            await i.editReply({ content: `삭제가 일부 완료되지 않았습니다: ${error instanceof Error ? error.message : "알 수 없는 오류"}`, components: [] });
+        }
+    }
+}
 async function select(custom, pid, i) { const [kind, user, amount] = custom.split(":"); const p = (0, store_1.getProblem)(pid); if (!p)
     return; if (kind === "deletechallenge") {
     if (p.threadId)
@@ -404,6 +558,9 @@ async function select(custom, pid, i) { const [kind, user, amount] = custom.spli
             await ch.messages.delete(p.cardMessageId).catch(() => undefined);
     }
     (0, store_1.removeProblem)(pid);
+    const genreChannel = await i.guild.channels.fetch(p.channelId).catch(() => null);
+    if (genreChannel?.type === discord_js_1.ChannelType.GuildText)
+        await genreChannel.setName((0, core_1.categoryChannelName)(p.genreKey, (0, store_1.getProblems)(i.guild.id, p.ctfKey).filter(problem => problem.genreKey === p.genreKey)));
 }
 else if (kind === "addpoint") {
     (0, store_1.patchProblem)(pid, { scores: { ...p.scores, [user]: Number(amount) }, solved: Number(amount) === 1 || p.solved });

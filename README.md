@@ -9,7 +9,8 @@
 - 참가 버튼으로 CTF 역할 지급
 - `/ctf createchallenge category name`: 소문자 분야 채널에 문제 카드 생성
 - 문제 카드의 참가 버튼을 처음 누를 때 비공개 스레드를 생성하고 이후 참가자를 같은 스레드에 추가
-- `/ctf solve`: Solver 1점, Contributor 0.5점 기록
+- `/ctf solve`: 개인 Solve 패널에서 Flag, Solver, Contributors를 확인한 뒤 기록
+- `📃｜solve`에는 문제별 해결 기록, `📣｜announce`에는 수정되는 분야별 진행 현황 게시
 - 분야별 문제를 모두 풀면 채널 표시가 `⬜`에서 `🟦`로 변경되고 새 문제가 추가되면 `⬜`로 복귀
 - `/ctf delete`: 확인 후 현재 CTF 공간, 참가 역할, 문제와 점수 기록 삭제
 - 프로필, 기록, 리더보드, 점수 보정, 문제 수정·삭제

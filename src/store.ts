@@ -16,10 +16,11 @@ export interface CtfProblem {
   id: string; guildId: string; ctfName: string; ctfKey: string; name: string;
   nameKey: string; genre: string; genreKey: string; channelId: string; threadId?: string;
   cardMessageId?: string; participants?: string[]; authorId: string;
-  scores: Record<string, number>; solved: boolean; externalId?: string; createdAt: number;
+  scores: Record<string, number>; solved: boolean; submittedFlag?: string;
+  externalId?: string; createdAt: number;
 }
-interface Db { contests: Record<string, CtfContest>; problems: Record<string, CtfProblem>; channels: Record<string, string>; }
-const empty = (): Db => ({ contests: {}, problems: {}, channels: {} });
+interface Db { contests: Record<string, CtfContest>; problems: Record<string, CtfProblem>; channels: Record<string, string>; messages: Record<string, string>; }
+const empty = (): Db => ({ contests: {}, problems: {}, channels: {}, messages: {} });
 function load(): Db { try { return existsSync(DB_PATH) ? { ...empty(), ...JSON.parse(readFileSync(DB_PATH, "utf8")) } : empty(); } catch { return empty(); } }
 let db = load();
 function save() { mkdirSync(dirname(DB_PATH), { recursive: true }); const tmp = `${DB_PATH}.tmp`; writeFileSync(tmp, JSON.stringify(db, null, 2)); renameSync(tmp, DB_PATH); }
@@ -33,6 +34,7 @@ export function removeContest(guildId: string, key: string) {
   for (const [id, problem] of Object.entries(db.problems)) if (problem.guildId === guildId && problem.ctfKey === key) delete db.problems[id];
   const channelPrefix = `${guildId}:${key}:`;
   for (const channelKey of Object.keys(db.channels)) if (channelKey.startsWith(channelPrefix)) delete db.channels[channelKey];
+  for (const messageKey of Object.keys(db.messages)) if (messageKey.startsWith(channelPrefix)) delete db.messages[messageKey];
   save();
 }
 export const getProblems = (guildId: string, key?: string) => Object.values(db.problems).filter((v) => v.guildId === guildId && (!key || v.ctfKey === key));
@@ -44,3 +46,10 @@ export function patchProblem(id: string, patch: Partial<CtfProblem>) { const val
 export function removeProblem(id: string) { delete db.problems[id]; save(); }
 export const getChannel = (guildId: string, key: string) => db.channels[`${guildId}:${key}`];
 export function putChannel(guildId: string, key: string, id: string) { db.channels[`${guildId}:${key}`] = id; save(); }
+export const getMessage = (guildId: string, key: string) => db.messages[`${guildId}:${key}`];
+export function putMessage(guildId: string, key: string, id: string) { db.messages[`${guildId}:${key}`] = id; save(); }
+export function getMessages(guildId: string, prefix: string) {
+  const fullPrefix = `${guildId}:${prefix}`;
+  return Object.entries(db.messages).filter(([key]) => key.startsWith(fullPrefix)).map(([key, id]) => ({ key: key.slice(guildId.length + 1), id }));
+}
+export function removeMessage(guildId: string, key: string) { delete db.messages[`${guildId}:${key}`]; save(); }

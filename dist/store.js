@@ -1,6 +1,6 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.getChannel = exports.findProblem = exports.getProblemByThread = exports.getProblem = exports.getProblems = exports.getContests = exports.getContest = exports.keyOf = void 0;
+exports.getMessage = exports.getChannel = exports.findProblem = exports.getProblemByThread = exports.getProblem = exports.getProblems = exports.getContests = exports.getContest = exports.keyOf = void 0;
 exports.putContest = putContest;
 exports.patchContest = patchContest;
 exports.removeContest = removeContest;
@@ -8,12 +8,15 @@ exports.putProblem = putProblem;
 exports.patchProblem = patchProblem;
 exports.removeProblem = removeProblem;
 exports.putChannel = putChannel;
+exports.putMessage = putMessage;
+exports.getMessages = getMessages;
+exports.removeMessage = removeMessage;
 const node_fs_1 = require("node:fs");
 const node_path_1 = require("node:path");
 const DB_PATH = process.env.DATABASE_PATH?.trim() || (0, node_path_1.join)(process.cwd(), "data.json");
 const keyOf = (value) => value.trim().toLowerCase();
 exports.keyOf = keyOf;
-const empty = () => ({ contests: {}, problems: {}, channels: {} });
+const empty = () => ({ contests: {}, problems: {}, channels: {}, messages: {} });
 function load() { try {
     return (0, node_fs_1.existsSync)(DB_PATH) ? { ...empty(), ...JSON.parse((0, node_fs_1.readFileSync)(DB_PATH, "utf8")) } : empty();
 }
@@ -39,6 +42,9 @@ function removeContest(guildId, key) {
     for (const channelKey of Object.keys(db.channels))
         if (channelKey.startsWith(channelPrefix))
             delete db.channels[channelKey];
+    for (const messageKey of Object.keys(db.messages))
+        if (messageKey.startsWith(channelPrefix))
+            delete db.messages[messageKey];
     save();
 }
 const getProblems = (guildId, key) => Object.values(db.problems).filter((v) => v.guildId === guildId && (!key || v.ctfKey === key));
@@ -56,3 +62,11 @@ function removeProblem(id) { delete db.problems[id]; save(); }
 const getChannel = (guildId, key) => db.channels[`${guildId}:${key}`];
 exports.getChannel = getChannel;
 function putChannel(guildId, key, id) { db.channels[`${guildId}:${key}`] = id; save(); }
+const getMessage = (guildId, key) => db.messages[`${guildId}:${key}`];
+exports.getMessage = getMessage;
+function putMessage(guildId, key, id) { db.messages[`${guildId}:${key}`] = id; save(); }
+function getMessages(guildId, prefix) {
+    const fullPrefix = `${guildId}:${prefix}`;
+    return Object.entries(db.messages).filter(([key]) => key.startsWith(fullPrefix)).map(([key, id]) => ({ key: key.slice(guildId.length + 1), id }));
+}
+function removeMessage(guildId, key) { delete db.messages[`${guildId}:${key}`]; save(); }
