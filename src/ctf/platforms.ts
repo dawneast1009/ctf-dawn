@@ -31,6 +31,23 @@ async function safeJson(url: string, init: RequestInit = {}): Promise<any> {
   }
 }
 
+async function safeText(url: string, init: RequestInit = {}): Promise<string> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10_000);
+  try {
+    const response = await fetch(url, {
+      ...init,
+      headers: { "User-Agent": USER_AGENT, Accept: "text/html", ...(init.headers ?? {}) },
+      signal: controller.signal,
+    });
+    if (response.status === 429) throw new Error("RATE_LIMITED");
+    if (!response.ok) throw new Error(`HTTP_${response.status}`);
+    return await response.text();
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 function baseUrl(input: string): string {
   return input.trim().replace(/\/+$/, "");
 }
@@ -45,13 +62,23 @@ function hspaceCompetitionId(input: string): string | null {
   }
 }
 
-export function parseHspaceChallenges(json: any): RemoteChallenge[] {
-  const rows = Array.isArray(json) ? json : Array.isArray(json?.data) ? json.data : Array.isArray(json?.challenges) ? json.challenges : [];
-  return rows.map((item: any) => ({
-    externalId: String(item._id ?? item.id ?? ""),
-    name: String(item.title ?? item.name ?? "").trim(),
-    category: String(item.category ?? "misc").trim(),
-  })).filter((item: RemoteChallenge) => item.externalId && item.name);
+function decodeHtml(value: string): string {
+  return value.replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#x27;|&#39;/gi, "'").replace(/&#(\d+);/g, (_, code) => String.fromCodePoint(Number(code)));
+}
+
+export function parseHspaceChallengePage(html: string, competitionId: string): RemoteChallenge[] {
+  const cards = new Map<string, RemoteChallenge>();
+  const cardPattern = new RegExp(`<a\\b[^>]*href=["']/competitions/${competitionId}/challenges/([a-f\\d]{24})["'][^>]*>([\\s\\S]*?)<\\/a>`, "gi");
+  for (const match of html.matchAll(cardPattern)) {
+    const parts = match[2]
+      .replace(/<(script|style|svg)\b[\s\S]*?<\/\1>/gi, " ")
+      .split(/<[^>]+>/)
+      .map((value) => decodeHtml(value).replace(/\s+/g, " ").trim())
+      .filter(Boolean);
+    if (parts.length < 2) continue;
+    cards.set(match[1], { externalId: match[1], category: parts[0], name: parts[1] });
+  }
+  return [...cards.values()];
 }
 
 export async function detectPlatform(url: string): Promise<PlatformKind> {
@@ -93,9 +120,9 @@ export async function fetchPublicChallenges(platform: PlatformKind, url: string,
     const competitionId = hspaceCompetitionId(base);
     if (!competitionId) throw new Error("HSPACE FORGE 대회 URL 형식이 아닙니다.");
     if (!hspaceAccessToken) throw new Error("HSPACE_ACCESS_TOKEN이 필요합니다.");
-    const json = await safeJson(`https://forge.hspace.io/api/competitions/${competitionId}/challenges`, { headers: { Cookie: `Access-Token=${hspaceAccessToken}` } });
-    const challenges = parseHspaceChallenges(json);
-    if (!challenges.length) throw new Error("HSPACE FORGE에서 문제 목록을 가져오지 못했습니다.");
+    const html = await safeText(base, { headers: { Cookie: `Access-Token=${hspaceAccessToken}` } });
+    const challenges = parseHspaceChallengePage(html, competitionId);
+    if (!challenges.length) throw new Error("HSPACE 로그인 페이지에서 문제 카드를 찾지 못했습니다. 새 Access-Token을 확인하세요.");
     return challenges;
   }
   throw new Error("이 플랫폼은 공개 문제 API 자동 감시를 지원하지 않습니다.");

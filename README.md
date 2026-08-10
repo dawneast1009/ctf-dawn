@@ -14,7 +14,7 @@
 - 프로필, 기록, 리더보드, 점수 보정, 문제 수정·삭제
 - CTFd/rCTF와 HSPACE FORGE 문제 Pull 및 공개 API 저부하 신규 문제 감시
 
-DAWN은 외부 대회에 플래그를 제출하지 않습니다. 문제 목록 GET 요청만 사용하며
+DAWN은 외부 대회에 플래그를 제출하지 않습니다. 공개 API 또는 대회 페이지 GET 요청만 사용하며
 기본 120초 간격으로 순차 조회합니다. 로그인 대회는 `/ctf pull`의 개인 입력 창에서
 Access-Token을 받고 AES-256-GCM으로 암호화해 대회별 자동 감시에 저장합니다.
 Refresh-Token은 사용하지 않으며 Access-Token 만료 시 Pull로 새 값을 입력합니다.
