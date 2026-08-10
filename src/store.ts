@@ -8,8 +8,9 @@ export interface CtfContest {
   guildId: string; key: string; name: string; roleId: string; categoryId: string;
   startsAt: number; endsAt: number; teamName?: string; lobbyChannelId?: string;
   lobbyMessageId?: string; solveStatusMessageId?: string; allSolved: boolean;
-  warningEnabled: boolean; platform?: "ctfd" | "rctf" | "generic";
-  sourceUrl?: string; publicApiReadable?: boolean; createdAt: number; updatedAt: number;
+  warningEnabled: boolean; platform?: "ctfd" | "rctf" | "hspace" | "generic";
+  sourceUrl?: string; publicApiReadable?: boolean; encryptedAccessToken?: string;
+  createdAt: number; updatedAt: number;
 }
 export interface CtfProblem {
   id: string; guildId: string; ctfName: string; ctfKey: string; name: string;

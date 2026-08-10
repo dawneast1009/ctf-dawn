@@ -5,6 +5,7 @@ const discord_js_1 = require("discord.js");
 const store_1 = require("./store");
 const core_1 = require("./ctf/core");
 const platforms_1 = require("./ctf/platforms");
+const secrets_1 = require("./ctf/secrets");
 const token = process.env.DISCORD_TOKEN;
 if (!token)
     throw new Error("DISCORD_TOKEN이 없습니다.");
@@ -13,6 +14,7 @@ const guildIds = (process.env.GUILD_IDS ?? "").split(",").map((v) => v.trim()).f
 const client = new discord_js_1.Client({ intents: [discord_js_1.GatewayIntentBits.Guilds] });
 const drafts = new Map();
 const deleteDrafts = new Map();
+const pullDrafts = new Map();
 const id = () => `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`;
 const adminSubs = new Set(["create", "createchallenge", "edit", "delete", "deletechallenge", "addpoint", "deletepoint", "pull", "warning", "defaultsettings"]);
 const command = new discord_js_1.SlashCommandBuilder().setName("ctf").setDescription("DAWN CTF workspace")
@@ -28,7 +30,7 @@ const command = new discord_js_1.SlashCommandBuilder().setName("ctf").setDescrip
     .addSubcommand((s) => s.setName("info").setDescription("Current CTF info"))
     .addSubcommand((s) => s.setName("leaderboard").setDescription("Contribution leaderboard"))
     .addSubcommand((s) => s.setName("profile").setDescription("Member profile").addUserOption((o) => o.setName("user").setDescription("member")))
-    .addSubcommand((s) => s.setName("pull").setDescription("Pull public CTFd/rCTF challenges").addStringOption((o) => o.setName("url").setDescription("platform URL").setRequired(true)))
+    .addSubcommand((s) => s.setName("pull").setDescription("Pull CTFd/rCTF/HSPACE challenges"))
     .addSubcommand((s) => s.setName("warning").setDescription("Toggle monitor").addBooleanOption((o) => o.setName("enabled").setDescription("state").setRequired(true)))
     .addSubcommand((s) => s.setName("defaultsettings").setDescription("Show defaults"));
 const core = [["general", "general"], ["bot", "bot-command"], ["announce", "📣｜announce"], ["credential", "🔑｜credential"], ["solve", "📃｜solve"], ["feed", "🤝｜feed"]];
@@ -114,8 +116,9 @@ async function syncCategoryChannels(guild, c) {
     }
 }
 async function status(guild, c) { const ps = (0, store_1.getProblems)(guild.id, c.key); const all = (0, core_1.isAllSolved)(ps); (0, store_1.patchContest)(guild.id, c.key, { allSolved: all }); await syncCategoryChannels(guild, c); const ch = await channel(guild, c, "solve", "📃｜solve"); await ch.send({ embeds: [new discord_js_1.EmbedBuilder().setTitle(all ? `🔵 ALL SOLVE · ${c.name}` : `⚪ ${c.name}`).setColor(all ? 0x3498db : 0xffffff).setDescription(`${ps.filter((p) => p.solved).length}/${ps.length} solved`)] }); }
-async function challenge(guild, c, category, name, externalId) { if ((0, store_1.findProblem)(guild.id, c.key, name))
-    return; const genre = (0, core_1.normalizeCtfCategory)(category); const ch = await channel(guild, c, `genre:${genre}`, `⬜｜${genre}`); const thread = await ch.threads.create({ name, type: discord_js_1.ChannelType.PublicThread, autoArchiveDuration: discord_js_1.ThreadAutoArchiveDuration.OneWeek }); const problem = { id: id(), guildId: guild.id, ctfName: c.name, ctfKey: c.key, name, nameKey: (0, store_1.keyOf)(name), genre, genreKey: genre, channelId: ch.id, threadId: thread.id, authorId: client.user.id, scores: {}, solved: false, externalId, createdAt: Date.now() }; (0, store_1.putProblem)(problem); await thread.send(`**${name}** · ${genre}\n이 스레드에서 \`/ctf solve\`를 사용하세요.`); await status(guild, c); return problem; }
+async function challenge(guild, c, category, name, externalId, updateStatus = true) { if ((0, store_1.findProblem)(guild.id, c.key, name))
+    return; const genre = (0, core_1.normalizeCtfCategory)(category); const ch = await channel(guild, c, `genre:${genre}`, `⬜｜${genre}`); const thread = await ch.threads.create({ name, type: discord_js_1.ChannelType.PublicThread, autoArchiveDuration: discord_js_1.ThreadAutoArchiveDuration.OneWeek }); const problem = { id: id(), guildId: guild.id, ctfName: c.name, ctfKey: c.key, name, nameKey: (0, store_1.keyOf)(name), genre, genreKey: genre, channelId: ch.id, threadId: thread.id, authorId: client.user.id, scores: {}, solved: false, externalId, createdAt: Date.now() }; (0, store_1.putProblem)(problem); await thread.send(`**${name}** · ${genre}\n이 스레드에서 \`/ctf solve\`를 사용하세요.`); if (updateStatus)
+    await status(guild, c); return problem; }
 client.once(discord_js_1.Events.ClientReady, async () => { for (const g of client.guilds.cache.values())
     if (!guildIds.length || guildIds.includes(g.id)) {
         await g.commands.set([command.toJSON()]);
@@ -129,6 +132,8 @@ client.on(discord_js_1.Events.InteractionCreate, async (i) => { try {
         await handle(i);
     else if (i.isButton())
         await button(i);
+    else if (i.isModalSubmit() && i.customId.startsWith("ctf-pull:"))
+        await pullModal(i);
     else if (i.isUserSelectMenu()) {
         const d = drafts.get(i.user.id);
         if (d) {
@@ -205,19 +210,13 @@ async function handle(i) {
                 totals.set(u, (totals.get(u) ?? 0) + n);
         return void await i.reply([...totals.entries()].sort((a, b) => b[1] - a[1]).map(([u, n], x) => `${x + 1}. <@${u}> · ${n}`).join("\n") || "기록 없음");
     }
-    if (sub === "pull" && c) {
-        await i.deferReply({ flags: discord_js_1.MessageFlags.Ephemeral });
-        const url = i.options.getString("url", true).replace(/\/+$/, "");
-        const platform = await (0, platforms_1.detectPlatform)(url);
-        if (platform === "generic")
-            return void await i.editReply("지원되는 공개 API가 아닙니다.");
-        const list = await (0, platforms_1.fetchPublicChallenges)(platform, url);
-        (0, store_1.patchContest)(i.guild.id, c.key, { platform, sourceUrl: url, publicApiReadable: true });
-        let n = 0;
-        for (const x of list)
-            if (await challenge(i.guild, c, x.category, x.name, x.externalId))
-                n++;
-        return void await i.editReply(`${n}개 문제 추가`);
+    if (sub === "pull") {
+        if (!c)
+            return void await i.reply({ content: "CTF 공간 안에서 실행하세요.", flags: discord_js_1.MessageFlags.Ephemeral });
+        const pullId = id();
+        pullDrafts.set(pullId, { guildId: i.guild.id, ctfKey: c.key, userId: i.user.id, createdAt: Date.now() });
+        const modal = new discord_js_1.ModalBuilder().setCustomId(`ctf-pull:${pullId}`).setTitle("CTF 문제 가져오기").addComponents(new discord_js_1.ActionRowBuilder().addComponents(new discord_js_1.TextInputBuilder().setCustomId("url").setLabel("대회 주소").setPlaceholder("https://forge.hspace.io/competitions/...").setStyle(discord_js_1.TextInputStyle.Short).setRequired(true)), new discord_js_1.ActionRowBuilder().addComponents(new discord_js_1.TextInputBuilder().setCustomId("access-token").setLabel("Access-Token (공개 대회는 비워두기)").setStyle(discord_js_1.TextInputStyle.Paragraph).setRequired(false)));
+        return void await i.showModal(modal);
     }
     if (sub === "warning" && c) {
         (0, store_1.patchContest)(i.guild.id, c.key, { warningEnabled: i.options.getBoolean("enabled", true) });
@@ -231,6 +230,39 @@ async function handle(i) {
         return void await i.reply({ content: "문제를 선택하세요.", components: [new discord_js_1.ActionRowBuilder().addComponents(menu)], flags: discord_js_1.MessageFlags.Ephemeral });
     }
 }
+async function pullModal(i) { const pullId = i.customId.slice(9), draft = pullDrafts.get(pullId); pullDrafts.delete(pullId); if (!i.guild || !draft || draft.guildId !== i.guild.id || draft.userId !== i.user.id || Date.now() - draft.createdAt > 300_000)
+    return void await i.reply({ content: "Pull 입력 창이 만료되었습니다. `/ctf pull`을 다시 실행하세요.", flags: discord_js_1.MessageFlags.Ephemeral }); const c = (0, store_1.getContest)(i.guild.id, draft.ctfKey); if (!c)
+    return void await i.reply({ content: "CTF 공간을 찾을 수 없습니다.", flags: discord_js_1.MessageFlags.Ephemeral }); await i.deferReply({ flags: discord_js_1.MessageFlags.Ephemeral }); try {
+    const url = i.fields.getTextInputValue("url").trim().replace(/\/+$/, "");
+    const accessToken = i.fields.getTextInputValue("access-token").trim();
+    const encryptedAccessToken = accessToken ? (0, secrets_1.encryptSecret)(accessToken) : undefined;
+    let platform = await (0, platforms_1.detectPlatform)(url), list;
+    if (platform === "hspace")
+        list = await (0, platforms_1.fetchPublicChallenges)(platform, url, accessToken);
+    else if (accessToken) {
+        const result = await (0, platforms_1.fetchChallengesWithToken)(url, accessToken);
+        platform = result.platform;
+        list = result.challenges;
+    }
+    else {
+        if (platform === "generic")
+            return void await i.editReply("지원되는 CTFd/rCTF/HSPACE 주소가 아닙니다.");
+        list = await (0, platforms_1.fetchPublicChallenges)(platform, url);
+    }
+    const ongoing = c.endsAt > Date.now();
+    (0, store_1.patchContest)(i.guild.id, c.key, { platform, sourceUrl: url, publicApiReadable: ongoing, encryptedAccessToken: ongoing ? encryptedAccessToken : undefined });
+    let n = 0;
+    for (const x of list)
+        if (await challenge(i.guild, c, x.category, x.name, x.externalId, false))
+            n++;
+    if (n)
+        await status(i.guild, c);
+    const tokenMessage = accessToken ? (ongoing ? "\nAccess-Token을 암호화해 이 대회의 자동 감시에 저장했습니다." : "\n종료된 대회라 Access-Token은 저장하지 않았습니다.") : "";
+    return void await i.editReply(`${list.length}개 확인 · ${n}개 문제 추가${tokenMessage}`);
+}
+catch (error) {
+    return void await i.editReply(`Pull 실패: ${error instanceof Error ? error.message : "알 수 없는 오류"}`);
+} }
 async function button(i) { if (i.customId.startsWith("join:") && i.guild) {
     const c = (0, store_1.getContest)(i.guild.id, i.customId.slice(5));
     await i.member.roles.add(c.roleId);
@@ -281,14 +313,28 @@ else if (kind === "deletepoint") {
     delete s[user];
     (0, store_1.patchProblem)(pid, { scores: s, solved: Object.values(s).some(n => n >= 1) });
 } await status(i.guild, (0, store_1.getContest)(i.guild.id, p.ctfKey)); await i.update({ content: "완료", components: [] }); }
-setInterval(async () => { for (const g of client.guilds.cache.values())
-    for (const c of (0, store_1.getContests)(g.id))
-        if (c.warningEnabled && c.publicApiReadable && c.platform && c.sourceUrl) {
-            try {
-                for (const x of await (0, platforms_1.fetchPublicChallenges)(c.platform, c.sourceUrl))
-                    await challenge(g, c, x.category, x.name, x.externalId);
-                await (0, platforms_1.fetchPublicScoreboard)(c.platform, c.sourceUrl);
+async function monitorContests() {
+    const now = Date.now();
+    for (const guild of client.guilds.cache.values())
+        for (const contest of (0, store_1.getContests)(guild.id)) {
+            if (contest.endsAt <= now) {
+                if (contest.warningEnabled || contest.publicApiReadable || contest.encryptedAccessToken)
+                    (0, store_1.patchContest)(guild.id, contest.key, { warningEnabled: false, publicApiReadable: false, encryptedAccessToken: undefined });
+                continue;
             }
-            catch { }
-        } }, Math.max(60, Number(process.env.CTF_MONITOR_INTERVAL_SECONDS) || 120) * 1000).unref();
+            if (!contest.warningEnabled || !contest.publicApiReadable || !contest.platform || !contest.sourceUrl)
+                continue;
+            try {
+                const accessToken = contest.encryptedAccessToken ? (0, secrets_1.decryptSecret)(contest.encryptedAccessToken) : undefined;
+                let added = 0;
+                for (const remote of await (0, platforms_1.fetchPublicChallenges)(contest.platform, contest.sourceUrl, accessToken))
+                    if (await challenge(guild, contest, remote.category, remote.name, remote.externalId, false))
+                        added++;
+                if (added)
+                    await status(guild, contest);
+            }
+            catch { /* 다음 주기에 다시 시도 */ }
+        }
+}
+setInterval(monitorContests, Math.max(60, Number(process.env.CTF_MONITOR_INTERVAL_SECONDS) || 120) * 1000).unref();
 client.login(token);

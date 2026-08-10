@@ -1,4 +1,4 @@
-export type PlatformKind = "ctfd" | "rctf" | "generic";
+export type PlatformKind = "ctfd" | "rctf" | "hspace" | "generic";
 
 export interface RemoteChallenge {
   externalId: string;
@@ -35,8 +35,28 @@ function baseUrl(input: string): string {
   return input.trim().replace(/\/+$/, "");
 }
 
+function hspaceCompetitionId(input: string): string | null {
+  try {
+    const url = new URL(input);
+    if (url.protocol !== "https:" || url.hostname !== "forge.hspace.io") return null;
+    return url.pathname.match(/^\/competitions\/([a-f\d]{24})(?:\/|$)/i)?.[1] ?? null;
+  } catch {
+    return null;
+  }
+}
+
+export function parseHspaceChallenges(json: any): RemoteChallenge[] {
+  const rows = Array.isArray(json) ? json : Array.isArray(json?.data) ? json.data : Array.isArray(json?.challenges) ? json.challenges : [];
+  return rows.map((item: any) => ({
+    externalId: String(item._id ?? item.id ?? ""),
+    name: String(item.title ?? item.name ?? "").trim(),
+    category: String(item.category ?? "misc").trim(),
+  })).filter((item: RemoteChallenge) => item.externalId && item.name);
+}
+
 export async function detectPlatform(url: string): Promise<PlatformKind> {
   const base = baseUrl(url);
+  if (hspaceCompetitionId(base)) return "hspace";
   try {
     const json = await safeJson(`${base}/api/v1/challenges`);
     if (json?.success && Array.isArray(json.data)) return "ctfd";
@@ -49,10 +69,10 @@ export async function detectPlatform(url: string): Promise<PlatformKind> {
 }
 
 /** 인증이 필요 없는 읽기 전용 문제 목록. 로그인 요청이나 플래그 제출은 하지 않는다. */
-export async function fetchPublicChallenges(platform: PlatformKind, url: string): Promise<RemoteChallenge[]> {
+export async function fetchPublicChallenges(platform: PlatformKind, url: string, hspaceAccessToken?: string): Promise<RemoteChallenge[]> {
   const base = baseUrl(url);
   if (platform === "ctfd") {
-    const json = await safeJson(`${base}/api/v1/challenges`);
+    const json = await safeJson(`${base}/api/v1/challenges`, hspaceAccessToken ? { headers: { Authorization: `Token ${hspaceAccessToken}` } } : undefined);
     if (!json?.success || !Array.isArray(json.data)) throw new Error("CTFd 문제 목록 형식이 아닙니다.");
     return json.data.map((item: any) => ({
       externalId: String(item.id),
@@ -61,13 +81,22 @@ export async function fetchPublicChallenges(platform: PlatformKind, url: string)
     })).filter((item: RemoteChallenge) => item.name);
   }
   if (platform === "rctf") {
-    const json = await safeJson(`${base}/api/v2/challs`);
+    const json = await safeJson(`${base}/api/v2/challs`, hspaceAccessToken ? { headers: { Authorization: `Bearer ${hspaceAccessToken}` } } : undefined);
     if (!Array.isArray(json?.data)) throw new Error("rCTF 문제 목록 형식이 아닙니다.");
     return json.data.map((item: any) => ({
       externalId: String(item.id),
       name: String(item.name ?? "").trim(),
       category: String(item.category ?? "misc").trim(),
     })).filter((item: RemoteChallenge) => item.name);
+  }
+  if (platform === "hspace") {
+    const competitionId = hspaceCompetitionId(base);
+    if (!competitionId) throw new Error("HSPACE FORGE 대회 URL 형식이 아닙니다.");
+    if (!hspaceAccessToken) throw new Error("HSPACE_ACCESS_TOKEN이 필요합니다.");
+    const json = await safeJson(`https://forge.hspace.io/api/competitions/${competitionId}/challenges`, { headers: { Cookie: `Access-Token=${hspaceAccessToken}` } });
+    const challenges = parseHspaceChallenges(json);
+    if (!challenges.length) throw new Error("HSPACE FORGE에서 문제 목록을 가져오지 못했습니다.");
+    return challenges;
   }
   throw new Error("이 플랫폼은 공개 문제 API 자동 감시를 지원하지 않습니다.");
 }
