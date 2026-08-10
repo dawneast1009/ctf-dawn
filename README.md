@@ -30,13 +30,3 @@ npm start
 Send Messages, Embed Links, Read Message History, Manage Channels, Manage Roles,
 Create Public Threads, Send Messages in Threads, Manage Threads 권한을 부여합니다.
 DAWN 역할은 봇이 만드는 `CTF: 대회명` 역할보다 위에 있어야 합니다.
-
-## 디스호스팅
-
-- 언어: JavaScript
-- Node.js: 22
-- 설치: `npm ci`
-- 시작: `npm start`
-- 환경변수는 `.env.example`의 항목만 패널에 등록
-
-`.env`와 `data.json`은 Git에 커밋하지 마세요.
