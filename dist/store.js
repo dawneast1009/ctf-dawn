@@ -1,6 +1,6 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.getMessage = exports.getChannel = exports.findProblem = exports.getProblemByThread = exports.getProblem = exports.getProblems = exports.getContests = exports.getContest = exports.keyOf = void 0;
+exports.getMessage = exports.getChannel = exports.findProblemByExternalId = exports.findProblem = exports.getProblemByThread = exports.getProblem = exports.getProblems = exports.getContests = exports.getContest = exports.keyOf = void 0;
 exports.putContest = putContest;
 exports.patchContest = patchContest;
 exports.removeContest = removeContest;
@@ -14,17 +14,49 @@ exports.removeMessage = removeMessage;
 const node_fs_1 = require("node:fs");
 const node_path_1 = require("node:path");
 const DB_PATH = process.env.DATABASE_PATH?.trim() || (0, node_path_1.join)(process.cwd(), "data.json");
+const BACKUP_PATH = `${DB_PATH}.bak`;
 const keyOf = (value) => value.trim().toLowerCase();
 exports.keyOf = keyOf;
 const empty = () => ({ contests: {}, problems: {}, channels: {}, messages: {} });
-function load() { try {
-    return (0, node_fs_1.existsSync)(DB_PATH) ? { ...empty(), ...JSON.parse((0, node_fs_1.readFileSync)(DB_PATH, "utf8")) } : empty();
+let loadedFromBackup = false;
+function readDb(path) {
+    const value = JSON.parse((0, node_fs_1.readFileSync)(path, "utf8"));
+    if (!value || typeof value !== "object" || Array.isArray(value))
+        throw new Error("DB 최상위 형식이 올바르지 않습니다.");
+    for (const key of ["contests", "problems", "channels", "messages"])
+        if (value[key] != null && (typeof value[key] !== "object" || Array.isArray(value[key])))
+            throw new Error(`DB ${key} 형식이 올바르지 않습니다.`);
+    return { ...empty(), ...value };
 }
-catch {
-    return empty();
-} }
+function load() {
+    if (!(0, node_fs_1.existsSync)(DB_PATH)) {
+        if (!(0, node_fs_1.existsSync)(BACKUP_PATH))
+            return empty();
+        console.warn(`기본 DB가 없어 백업을 복구했습니다: ${BACKUP_PATH}`);
+        loadedFromBackup = true;
+        return readDb(BACKUP_PATH);
+    }
+    try {
+        return readDb(DB_PATH);
+    }
+    catch (error) {
+        if ((0, node_fs_1.existsSync)(BACKUP_PATH)) {
+            try {
+                console.error(`DB 손상 감지, 백업을 사용합니다: ${error instanceof Error ? error.message : error}`);
+                const backup = readDb(BACKUP_PATH);
+                loadedFromBackup = true;
+                return backup;
+            }
+            catch (backupError) {
+                throw new Error(`DB와 백업을 모두 읽을 수 없습니다: ${backupError instanceof Error ? backupError.message : backupError}`);
+            }
+        }
+        throw new Error(`DB를 읽을 수 없습니다: ${error instanceof Error ? error.message : error}`);
+    }
+}
 let db = load();
-function save() { (0, node_fs_1.mkdirSync)((0, node_path_1.dirname)(DB_PATH), { recursive: true }); const tmp = `${DB_PATH}.tmp`; (0, node_fs_1.writeFileSync)(tmp, JSON.stringify(db, null, 2)); (0, node_fs_1.renameSync)(tmp, DB_PATH); }
+function save() { (0, node_fs_1.mkdirSync)((0, node_path_1.dirname)(DB_PATH), { recursive: true, mode: 0o700 }); const tmp = `${DB_PATH}.tmp`; (0, node_fs_1.writeFileSync)(tmp, JSON.stringify(db, null, 2), { mode: 0o600 }); if ((0, node_fs_1.existsSync)(DB_PATH) && !loadedFromBackup)
+    (0, node_fs_1.copyFileSync)(DB_PATH, BACKUP_PATH); (0, node_fs_1.renameSync)(tmp, DB_PATH); loadedFromBackup = false; }
 const contestKey = (guildId, key) => `${guildId}:${key}`;
 const getContest = (guildId, key) => db.contests[contestKey(guildId, key)];
 exports.getContest = getContest;
@@ -55,6 +87,8 @@ const getProblemByThread = (id) => Object.values(db.problems).find((v) => v.thre
 exports.getProblemByThread = getProblemByThread;
 const findProblem = (guildId, key, name) => (0, exports.getProblems)(guildId, key).find((v) => v.nameKey === (0, exports.keyOf)(name));
 exports.findProblem = findProblem;
+const findProblemByExternalId = (guildId, key, externalId) => (0, exports.getProblems)(guildId, key).find((v) => v.externalId === externalId);
+exports.findProblemByExternalId = findProblemByExternalId;
 function putProblem(value) { db.problems[value.id] = value; save(); }
 function patchProblem(id, patch) { const value = db.problems[id]; if (!value)
     return; Object.assign(value, patch); save(); return value; }

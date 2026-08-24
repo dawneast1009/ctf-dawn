@@ -1,7 +1,8 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 const DB_PATH = process.env.DATABASE_PATH?.trim() || join(process.cwd(), "data.json");
+const BACKUP_PATH = `${DB_PATH}.bak`;
 export const keyOf = (value: string) => value.trim().toLowerCase();
 
 export interface CtfContest {
@@ -10,6 +11,8 @@ export interface CtfContest {
   lobbyMessageId?: string; solveStatusMessageId?: string; allSolved: boolean;
   warningEnabled: boolean; platform?: "ctfd" | "rctf" | "hspace" | "generic";
   sourceUrl?: string; publicApiReadable?: boolean; encryptedAccessToken?: string;
+  authenticationType?: "token" | "session";
+  monitorError?: string; monitorErrorAt?: number;
   createdAt: number; updatedAt: number;
 }
 export interface CtfProblem {
@@ -21,9 +24,31 @@ export interface CtfProblem {
 }
 interface Db { contests: Record<string, CtfContest>; problems: Record<string, CtfProblem>; channels: Record<string, string>; messages: Record<string, string>; }
 const empty = (): Db => ({ contests: {}, problems: {}, channels: {}, messages: {} });
-function load(): Db { try { return existsSync(DB_PATH) ? { ...empty(), ...JSON.parse(readFileSync(DB_PATH, "utf8")) } : empty(); } catch { return empty(); } }
+let loadedFromBackup = false;
+function readDb(path: string): Db {
+  const value = JSON.parse(readFileSync(path, "utf8"));
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("DB 최상위 형식이 올바르지 않습니다.");
+  for (const key of ["contests", "problems", "channels", "messages"]) if (value[key] != null && (typeof value[key] !== "object" || Array.isArray(value[key]))) throw new Error(`DB ${key} 형식이 올바르지 않습니다.`);
+  return { ...empty(), ...value };
+}
+function load(): Db {
+  if (!existsSync(DB_PATH)) {
+    if (!existsSync(BACKUP_PATH)) return empty();
+    console.warn(`기본 DB가 없어 백업을 복구했습니다: ${BACKUP_PATH}`);
+    loadedFromBackup = true;
+    return readDb(BACKUP_PATH);
+  }
+  try { return readDb(DB_PATH); }
+  catch (error) {
+    if (existsSync(BACKUP_PATH)) {
+      try { console.error(`DB 손상 감지, 백업을 사용합니다: ${error instanceof Error ? error.message : error}`); const backup = readDb(BACKUP_PATH); loadedFromBackup = true; return backup; }
+      catch (backupError) { throw new Error(`DB와 백업을 모두 읽을 수 없습니다: ${backupError instanceof Error ? backupError.message : backupError}`); }
+    }
+    throw new Error(`DB를 읽을 수 없습니다: ${error instanceof Error ? error.message : error}`);
+  }
+}
 let db = load();
-function save() { mkdirSync(dirname(DB_PATH), { recursive: true }); const tmp = `${DB_PATH}.tmp`; writeFileSync(tmp, JSON.stringify(db, null, 2)); renameSync(tmp, DB_PATH); }
+function save() { mkdirSync(dirname(DB_PATH), { recursive: true, mode: 0o700 }); const tmp = `${DB_PATH}.tmp`; writeFileSync(tmp, JSON.stringify(db, null, 2), { mode: 0o600 }); if (existsSync(DB_PATH) && !loadedFromBackup) copyFileSync(DB_PATH, BACKUP_PATH); renameSync(tmp, DB_PATH); loadedFromBackup = false; }
 const contestKey = (guildId: string, key: string) => `${guildId}:${key}`;
 export const getContest = (guildId: string, key: string) => db.contests[contestKey(guildId, key)];
 export const getContests = (guildId: string) => Object.values(db.contests).filter((v) => v.guildId === guildId);
@@ -41,6 +66,7 @@ export const getProblems = (guildId: string, key?: string) => Object.values(db.p
 export const getProblem = (id: string) => db.problems[id];
 export const getProblemByThread = (id: string) => Object.values(db.problems).find((v) => v.threadId != null && v.threadId === id);
 export const findProblem = (guildId: string, key: string, name: string) => getProblems(guildId, key).find((v) => v.nameKey === keyOf(name));
+export const findProblemByExternalId = (guildId: string, key: string, externalId: string) => getProblems(guildId, key).find((v) => v.externalId === externalId);
 export function putProblem(value: CtfProblem) { db.problems[value.id] = value; save(); }
 export function patchProblem(id: string, patch: Partial<CtfProblem>) { const value = db.problems[id]; if (!value) return; Object.assign(value, patch); save(); return value; }
 export function removeProblem(id: string) { delete db.problems[id]; save(); }

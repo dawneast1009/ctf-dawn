@@ -19,6 +19,19 @@ const threadOpenings = new Map();
 const legacyStatusCleaned = new Set();
 const id = () => `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`;
 const adminSubs = new Set(["create", "createchallenge", "edit", "delete", "deletechallenge", "addpoint", "deletepoint", "pull", "warning", "defaultsettings"]);
+function pruneExpiredDrafts() {
+    const now = Date.now();
+    for (const [draftId, draft] of solveDrafts)
+        if (now - draft.createdAt > 10 * 60_000)
+            solveDrafts.delete(draftId);
+    for (const [draftId, draft] of deleteDrafts)
+        if (now - draft.createdAt > 5 * 60_000)
+            deleteDrafts.delete(draftId);
+    for (const [draftId, draft] of pullDrafts)
+        if (now - draft.createdAt > 5 * 60_000)
+            pullDrafts.delete(draftId);
+}
+setInterval(pruneExpiredDrafts, 5 * 60_000).unref();
 const command = new discord_js_1.SlashCommandBuilder().setName("ctf").setDescription("DAWN CTF workspace")
     .addSubcommand((s) => s.setName("create").setDescription("Create a CTF workspace").addStringOption((o) => o.setName("name").setDescription("CTF name").setRequired(true)).addStringOption((o) => o.setName("start").setDescription("KST YYYY-MM-DD HH:mm").setRequired(true)).addStringOption((o) => o.setName("end").setDescription("KST YYYY-MM-DD HH:mm").setRequired(true)).addStringOption((o) => o.setName("team").setDescription("External team name").setRequired(false)))
     .addSubcommand((s) => s.setName("createchallenge").setDescription("Create challenge here").addStringOption((o) => o.setName("category").setDescription("lowercase category").setRequired(true)).addStringOption((o) => o.setName("name").setDescription("challenge name").setRequired(true)))
@@ -54,12 +67,15 @@ async function announcementChannel(guild) {
 }
 async function ensureContestAnnouncement(guild, contest) {
     const announcements = await announcementChannel(guild);
+    const payload = { content: `다음 대회: **${contest.name}**\n일정: <t:${Math.floor(contest.startsAt / 1000)}:f> ~ <t:${Math.floor(contest.endsAt / 1000)}:f>`, components: [new discord_js_1.ActionRowBuilder().addComponents(new discord_js_1.ButtonBuilder().setCustomId(`join:${contest.key}`).setLabel("참가할게").setEmoji("👋").setStyle(discord_js_1.ButtonStyle.Primary))] };
     if (contest.lobbyChannelId === announcements.id && contest.lobbyMessageId) {
         const existing = await announcements.messages.fetch(contest.lobbyMessageId).catch(() => null);
-        if (existing)
+        if (existing) {
+            await existing.edit(payload);
             return contest;
+        }
     }
-    const message = await announcements.send({ content: `다음 대회: **${contest.name}**\n일정: <t:${Math.floor(contest.startsAt / 1000)}:f> ~ <t:${Math.floor(contest.endsAt / 1000)}:f>`, components: [new discord_js_1.ActionRowBuilder().addComponents(new discord_js_1.ButtonBuilder().setCustomId(`join:${contest.key}`).setLabel("참가할게").setEmoji("👋").setStyle(discord_js_1.ButtonStyle.Primary))] });
+    const message = await announcements.send(payload);
     return (0, store_1.patchContest)(guild.id, contest.key, { lobbyChannelId: announcements.id, lobbyMessageId: message.id });
 }
 async function deleteContestWorkspace(guild, contest) {
@@ -90,7 +106,10 @@ async function deleteContestWorkspace(guild, contest) {
 async function workspace(guild, name, startsAt, endsAt, teamName) {
     const key = (0, store_1.keyOf)(name);
     let role = (0, store_1.getContest)(guild.id, key)?.roleId ? await guild.roles.fetch((0, store_1.getContest)(guild.id, key).roleId).catch(() => null) : null;
-    role ??= await guild.roles.create({ name: `CTF: ${name}` });
+    const roleName = name.trim().slice(0, 100);
+    if (role && role.name !== roleName)
+        await role.setName(roleName);
+    role ??= await guild.roles.create({ name: roleName });
     let cat = (0, store_1.getContest)(guild.id, key)?.categoryId ? await guild.channels.fetch((0, store_1.getContest)(guild.id, key).categoryId).catch(() => null) : null;
     cat ??= await guild.channels.create({ name: `🚩 ${name}`.slice(0, 95), type: discord_js_1.ChannelType.GuildCategory, permissionOverwrites: [{ id: guild.roles.everyone.id, deny: [discord_js_1.PermissionFlagsBits.ViewChannel] }, { id: role.id, allow: [discord_js_1.PermissionFlagsBits.ViewChannel] }, { id: guild.members.me.id, allow: [discord_js_1.PermissionFlagsBits.ViewChannel, discord_js_1.PermissionFlagsBits.ManageChannels, discord_js_1.PermissionFlagsBits.ManageThreads, discord_js_1.PermissionFlagsBits.SendMessages] }] });
     const old = (0, store_1.getContest)(guild.id, key);
@@ -159,8 +178,12 @@ function solveDraftPayload(draftId, draft, problem, solverPicker = false, conten
 }
 function activeSolveDraft(draftId, userId) {
     const draft = solveDrafts.get(draftId);
-    if (!draft || draft.ownerId !== userId || Date.now() - draft.createdAt > 10 * 60_000)
+    if (!draft || draft.ownerId !== userId)
         return null;
+    if (Date.now() - draft.createdAt > 10 * 60_000) {
+        solveDrafts.delete(draftId);
+        return null;
+    }
     return draft;
 }
 async function ensureChallengeCard(guild, problem) {
@@ -292,10 +315,41 @@ catch (error) {
     throw error;
 } if (updateStatus)
     await status(guild, c); return (0, store_1.getProblem)(problem.id); }
+async function syncRemoteChallenge(guild, contest, remote) {
+    const existing = (0, store_1.findProblemByExternalId)(guild.id, contest.key, remote.externalId) ?? (0, store_1.findProblem)(guild.id, contest.key, remote.name);
+    if (!existing) {
+        await challenge(guild, contest, remote.category, remote.name, remote.externalId, false);
+        return "created";
+    }
+    const patch = {};
+    if (existing.name !== remote.name)
+        Object.assign(patch, { name: remote.name, nameKey: (0, store_1.keyOf)(remote.name) });
+    if (existing.externalId !== remote.externalId)
+        patch.externalId = remote.externalId;
+    const remoteGenre = (0, core_1.normalizeCtfCategory)(remote.category);
+    if (existing.genreKey !== remoteGenre && !existing.threadId) {
+        if (existing.cardMessageId) {
+            const oldChannel = await guild.channels.fetch(existing.channelId).catch(() => null);
+            if (oldChannel?.type === discord_js_1.ChannelType.GuildText)
+                await oldChannel.messages.delete(existing.cardMessageId).catch(() => undefined);
+        }
+        const nextChannel = await channel(guild, contest, `genre:${remoteGenre}`, `⬜｜${remoteGenre}`);
+        Object.assign(patch, { genre: remoteGenre, genreKey: remoteGenre, channelId: nextChannel.id, cardMessageId: undefined });
+    }
+    if (!Object.keys(patch).length)
+        return "unchanged";
+    (0, store_1.patchProblem)(existing.id, patch);
+    await refreshChallengeCard(guild, (0, store_1.getProblem)(existing.id));
+    return "updated";
+}
 client.once(discord_js_1.Events.ClientReady, async () => { for (const g of client.guilds.cache.values())
     if (!guildIds.length || guildIds.includes(g.id)) {
         await g.commands.set([command.toJSON()]);
         for (const c of (0, store_1.getContests)(g.id)) {
+            const role = await g.roles.fetch(c.roleId).catch(() => null);
+            const roleName = c.name.trim().slice(0, 100);
+            if (role && role.name !== roleName)
+                await role.setName(roleName).catch((error) => console.warn(`역할 이름 갱신 실패 (${c.name}):`, error));
             await ensureContestAnnouncement(g, c);
             await ensureChallengeCards(g, c);
             await status(g, c);
@@ -364,7 +418,8 @@ async function handle(i) {
         const s = start ? (0, core_1.parseKstDateTime)(start) : c.startsAt, e = end ? (0, core_1.parseKstDateTime)(end) : c.endsAt;
         if (!s || !e || e <= s)
             return void await i.reply({ content: "KST 일정을 확인하세요.", flags: discord_js_1.MessageFlags.Ephemeral });
-        (0, store_1.patchContest)(i.guild.id, c.key, { startsAt: s, endsAt: e, teamName: i.options.getString("team") ?? c.teamName });
+        const updated = (0, store_1.patchContest)(i.guild.id, c.key, { startsAt: s, endsAt: e, teamName: i.options.getString("team") ?? c.teamName });
+        await ensureContestAnnouncement(i.guild, updated);
         return void await i.reply({ content: "CTF 정보 수정 완료", flags: discord_js_1.MessageFlags.Ephemeral });
     }
     if (sub === "profile" || sub === "history") {
@@ -384,7 +439,7 @@ async function handle(i) {
             return void await i.reply({ content: "CTF 공간 안에서 실행하세요.", flags: discord_js_1.MessageFlags.Ephemeral });
         const pullId = id();
         pullDrafts.set(pullId, { guildId: i.guild.id, ctfKey: c.key, userId: i.user.id, createdAt: Date.now() });
-        const modal = new discord_js_1.ModalBuilder().setCustomId(`ctf-pull:${pullId}`).setTitle("CTF 문제 가져오기").addComponents(new discord_js_1.ActionRowBuilder().addComponents(new discord_js_1.TextInputBuilder().setCustomId("url").setLabel("대회 주소").setPlaceholder("https://forge.hspace.io/competitions/...").setStyle(discord_js_1.TextInputStyle.Short).setRequired(true)), new discord_js_1.ActionRowBuilder().addComponents(new discord_js_1.TextInputBuilder().setCustomId("access-token").setLabel("Access-Token (공개 대회는 비워두기)").setStyle(discord_js_1.TextInputStyle.Paragraph).setRequired(false)));
+        const modal = new discord_js_1.ModalBuilder().setCustomId(`ctf-pull:${pullId}`).setTitle("CTF 문제 가져오기").addComponents(new discord_js_1.ActionRowBuilder().addComponents(new discord_js_1.TextInputBuilder().setCustomId("url").setLabel("대회 주소").setPlaceholder("https://ctf.example.com").setStyle(discord_js_1.TextInputStyle.Short).setRequired(true)), new discord_js_1.ActionRowBuilder().addComponents(new discord_js_1.TextInputBuilder().setCustomId("access-token").setLabel("API / Access Token (선택)").setStyle(discord_js_1.TextInputStyle.Paragraph).setRequired(false)), new discord_js_1.ActionRowBuilder().addComponents(new discord_js_1.TextInputBuilder().setCustomId("session-cookie").setLabel("CTFd session 쿠키값 (선택)").setPlaceholder("session=... 또는 쿠키값만 입력").setStyle(discord_js_1.TextInputStyle.Paragraph).setRequired(false)));
         return void await i.showModal(modal);
     }
     if (sub === "warning" && c) {
@@ -399,39 +454,72 @@ async function handle(i) {
         return void await i.reply({ content: "문제를 선택하세요.", components: [new discord_js_1.ActionRowBuilder().addComponents(menu)], flags: discord_js_1.MessageFlags.Ephemeral });
     }
 }
-async function pullModal(i) { const pullId = i.customId.slice(9), draft = pullDrafts.get(pullId); pullDrafts.delete(pullId); if (!i.guild || !draft || draft.guildId !== i.guild.id || draft.userId !== i.user.id || Date.now() - draft.createdAt > 300_000)
-    return void await i.reply({ content: "Pull 입력 창이 만료되었습니다. `/ctf pull`을 다시 실행하세요.", flags: discord_js_1.MessageFlags.Ephemeral }); const c = (0, store_1.getContest)(i.guild.id, draft.ctfKey); if (!c)
-    return void await i.reply({ content: "CTF 공간을 찾을 수 없습니다.", flags: discord_js_1.MessageFlags.Ephemeral }); await i.deferReply({ flags: discord_js_1.MessageFlags.Ephemeral }); try {
-    const url = i.fields.getTextInputValue("url").trim().replace(/\/+$/, "");
-    const accessToken = i.fields.getTextInputValue("access-token").trim();
-    const encryptedAccessToken = accessToken ? (0, secrets_1.encryptSecret)(accessToken) : undefined;
-    let platform = await (0, platforms_1.detectPlatform)(url), list;
-    if (platform === "hspace")
-        list = await (0, platforms_1.fetchPublicChallenges)(platform, url, accessToken);
-    else if (accessToken) {
-        const result = await (0, platforms_1.fetchChallengesWithToken)(url, accessToken);
-        platform = result.platform;
-        list = result.challenges;
+async function pullModal(i) {
+    const pullId = i.customId.slice(9), draft = pullDrafts.get(pullId);
+    pullDrafts.delete(pullId);
+    if (!i.guild || !draft || draft.guildId !== i.guild.id || draft.userId !== i.user.id || Date.now() - draft.createdAt > 300_000)
+        return void await i.reply({ content: "Pull 입력 창이 만료되었습니다. `/ctf pull`을 다시 실행하세요.", flags: discord_js_1.MessageFlags.Ephemeral });
+    const c = (0, store_1.getContest)(i.guild.id, draft.ctfKey);
+    if (!c)
+        return void await i.reply({ content: "CTF 공간을 찾을 수 없습니다.", flags: discord_js_1.MessageFlags.Ephemeral });
+    await i.deferReply({ flags: discord_js_1.MessageFlags.Ephemeral });
+    try {
+        const url = i.fields.getTextInputValue("url").trim().replace(/\/+$/, "");
+        const accessToken = i.fields.getTextInputValue("access-token").trim();
+        const sessionCookie = i.fields.getTextInputValue("session-cookie").trim();
+        if (accessToken && sessionCookie)
+            return void await i.editReply("API 토큰과 CTFd session 쿠키 중 하나만 입력하세요.");
+        const authenticationType = sessionCookie ? "session" : accessToken ? "token" : undefined;
+        const authenticationSecret = sessionCookie || accessToken;
+        const auth = authenticationSecret && authenticationType ? { type: authenticationType, value: authenticationSecret } : undefined;
+        const encryptedAccessToken = authenticationSecret ? (0, secrets_1.encryptSecret)(authenticationSecret) : undefined;
+        let platform, list;
+        if (sessionCookie) {
+            const result = await (0, platforms_1.fetchChallengesWithSession)(url, sessionCookie);
+            platform = result.platform;
+            list = result.challenges;
+        }
+        else {
+            platform = await (0, platforms_1.detectPlatform)(url);
+            if (platform === "hspace")
+                list = await (0, platforms_1.fetchPublicChallenges)(platform, url, auth);
+            else if (accessToken) {
+                const result = await (0, platforms_1.fetchChallengesWithToken)(url, accessToken);
+                platform = result.platform;
+                list = result.challenges;
+            }
+            else {
+                if (platform === "generic")
+                    return void await i.editReply("지원되는 CTFd/rCTF/HSPACE 주소가 아니거나 인증정보가 필요합니다.");
+                list = await (0, platforms_1.fetchPublicChallenges)(platform, url);
+            }
+        }
+        const schedule = platform === "ctfd" ? await (0, platforms_1.fetchCtfdContestSchedule)(url, auth).catch(() => undefined) : undefined;
+        const scheduleChanged = !!schedule && (schedule.startsAt !== c.startsAt || schedule.endsAt !== c.endsAt);
+        const startsAt = schedule?.startsAt ?? c.startsAt;
+        const endsAt = schedule?.endsAt ?? c.endsAt;
+        const ongoing = endsAt > Date.now();
+        const updatedContest = (0, store_1.patchContest)(i.guild.id, c.key, { startsAt, endsAt, platform, sourceUrl: url, publicApiReadable: ongoing, encryptedAccessToken: ongoing ? encryptedAccessToken : undefined, authenticationType: ongoing ? authenticationType : undefined, monitorError: undefined, monitorErrorAt: undefined });
+        if (scheduleChanged)
+            await ensureContestAnnouncement(i.guild, updatedContest);
+        let added = 0, updated = 0;
+        for (const remote of list) {
+            const result = await syncRemoteChallenge(i.guild, updatedContest, remote);
+            if (result === "created")
+                added++;
+            else if (result === "updated")
+                updated++;
+        }
+        if (added || updated)
+            await status(i.guild, updatedContest);
+        const scheduleMessage = schedule ? `\nCTFd 일정 자동 반영: <t:${Math.floor(startsAt / 1000)}:f> ~ <t:${Math.floor(endsAt / 1000)}:f>` : platform === "ctfd" ? "\nCTFd에서 일정을 찾지 못해 기존 일정을 유지했습니다." : "";
+        const authMessage = authenticationSecret ? (ongoing ? `\n${authenticationType === "session" ? "세션 쿠키" : "토큰"}을 암호화해 이 대회의 자동 감시에 저장했습니다.` : `\n종료된 대회라 ${authenticationType === "session" ? "세션 쿠키" : "토큰"}은 저장하지 않았습니다.`) : "";
+        return void await i.editReply(`${list.length}개 확인 · ${added}개 추가 · ${updated}개 갱신${scheduleMessage}${authMessage}`);
     }
-    else {
-        if (platform === "generic")
-            return void await i.editReply("지원되는 CTFd/rCTF/HSPACE 주소가 아닙니다.");
-        list = await (0, platforms_1.fetchPublicChallenges)(platform, url);
+    catch (error) {
+        return void await i.editReply(`Pull 실패: ${error instanceof Error ? error.message : "알 수 없는 오류"}`);
     }
-    const ongoing = c.endsAt > Date.now();
-    (0, store_1.patchContest)(i.guild.id, c.key, { platform, sourceUrl: url, publicApiReadable: ongoing, encryptedAccessToken: ongoing ? encryptedAccessToken : undefined });
-    let n = 0;
-    for (const x of list)
-        if (await challenge(i.guild, c, x.category, x.name, x.externalId, false))
-            n++;
-    if (n)
-        await status(i.guild, c);
-    const tokenMessage = accessToken ? (ongoing ? "\nAccess-Token을 암호화해 이 대회의 자동 감시에 저장했습니다." : "\n종료된 대회라 Access-Token은 저장하지 않았습니다.") : "";
-    return void await i.editReply(`${list.length}개 확인 · ${n}개 문제 추가${tokenMessage}`);
 }
-catch (error) {
-    return void await i.editReply(`Pull 실패: ${error instanceof Error ? error.message : "알 수 없는 오류"}`);
-} }
 async function solveSelect(i) {
     const solverMode = i.customId.startsWith("solve-solver:");
     const draftId = i.customId.slice(solverMode ? 13 : 14);
@@ -582,28 +670,50 @@ else if (kind === "deletepoint") {
     (0, store_1.patchProblem)(pid, { scores: s, solved: Object.values(s).some(n => n >= 1) });
     await refreshChallengeCard(i.guild, (0, store_1.getProblem)(pid));
 } await status(i.guild, (0, store_1.getContest)(i.guild.id, p.ctfKey)); await i.update({ content: "완료", components: [] }); }
-async function monitorContests() {
-    const now = Date.now();
-    for (const guild of client.guilds.cache.values())
-        for (const contest of (0, store_1.getContests)(guild.id)) {
-            if (contest.endsAt <= now) {
-                if (contest.warningEnabled || contest.publicApiReadable || contest.encryptedAccessToken)
-                    (0, store_1.patchContest)(guild.id, contest.key, { warningEnabled: false, publicApiReadable: false, encryptedAccessToken: undefined });
-                continue;
-            }
-            if (!contest.warningEnabled || !contest.publicApiReadable || !contest.platform || !contest.sourceUrl)
-                continue;
-            try {
-                const accessToken = contest.encryptedAccessToken ? (0, secrets_1.decryptSecret)(contest.encryptedAccessToken) : undefined;
-                let added = 0;
-                for (const remote of await (0, platforms_1.fetchPublicChallenges)(contest.platform, contest.sourceUrl, accessToken))
-                    if (await challenge(guild, contest, remote.category, remote.name, remote.externalId, false))
-                        added++;
-                if (added)
-                    await status(guild, contest);
-            }
-            catch { /* 다음 주기에 다시 시도 */ }
-        }
+let monitorRunning = false;
+async function notifyMonitorError(guild, contest, error) {
+    const message = error instanceof Error ? error.message : "알 수 없는 오류";
+    if (contest.monitorError === message && Date.now() - (contest.monitorErrorAt ?? 0) < 60 * 60_000)
+        return;
+    const credentialChannel = await channel(guild, contest, "credential", "🔑｜credential");
+    await credentialChannel.send(`⚠️ **${contest.name}** 문제 자동 감시에 실패했습니다.\n${message}\n인증이 만료됐다면 \`/ctf pull\`로 다시 입력하세요.`);
+    (0, store_1.patchContest)(guild.id, contest.key, { monitorError: message, monitorErrorAt: Date.now() });
 }
-setInterval(monitorContests, Math.max(60, Number(process.env.CTF_MONITOR_INTERVAL_SECONDS) || 120) * 1000).unref();
+async function monitorContests() {
+    if (monitorRunning)
+        return;
+    monitorRunning = true;
+    try {
+        const now = Date.now();
+        for (const guild of client.guilds.cache.values())
+            for (const contest of (0, store_1.getContests)(guild.id)) {
+                if (contest.endsAt <= now) {
+                    if (contest.warningEnabled || contest.publicApiReadable || contest.encryptedAccessToken || contest.monitorError)
+                        (0, store_1.patchContest)(guild.id, contest.key, { warningEnabled: false, publicApiReadable: false, encryptedAccessToken: undefined, authenticationType: undefined, monitorError: undefined, monitorErrorAt: undefined });
+                    continue;
+                }
+                if (!contest.warningEnabled || !contest.publicApiReadable || !contest.platform || !contest.sourceUrl)
+                    continue;
+                try {
+                    const accessToken = contest.encryptedAccessToken ? (0, secrets_1.decryptSecret)(contest.encryptedAccessToken) : undefined;
+                    const auth = accessToken ? { type: contest.authenticationType ?? "token", value: accessToken } : undefined;
+                    let changed = 0;
+                    for (const remote of await (0, platforms_1.fetchPublicChallenges)(contest.platform, contest.sourceUrl, auth))
+                        if (await syncRemoteChallenge(guild, contest, remote) !== "unchanged")
+                            changed++;
+                    if (changed)
+                        await status(guild, contest);
+                    if (contest.monitorError)
+                        (0, store_1.patchContest)(guild.id, contest.key, { monitorError: undefined, monitorErrorAt: undefined });
+                }
+                catch (error) {
+                    await notifyMonitorError(guild, contest, error).catch((notifyError) => console.error("감시 오류 알림 실패:", notifyError));
+                }
+            }
+    }
+    finally {
+        monitorRunning = false;
+    }
+}
+setInterval(() => void monitorContests().catch((error) => console.error("자동 감시 실패:", error)), Math.max(60, Number(process.env.CTF_MONITOR_INTERVAL_SECONDS) || 120) * 1000).unref();
 client.login(token);
