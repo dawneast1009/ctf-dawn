@@ -281,6 +281,112 @@ test("기존 CTFd API 토큰 인증을 유지한다", async () => {
   }
 });
 
+test("시작 전 CTFd도 토큰 인증을 확인하고 빈 문제 목록으로 연결한다", async () => {
+  const originalFetch = globalThis.fetch;
+  const oldPrivateHosts = process.env.CTF_ALLOW_PRIVATE_HOSTS;
+  process.env.CTF_ALLOW_PRIVATE_HOSTS = "true";
+  let contentType = "";
+  let tokenVerified = false;
+  globalThis.fetch = async (input, init) => {
+    if (String(input).endsWith("/api/v1/challenges")) {
+      contentType = new Headers(init?.headers).get("content-type") ?? "";
+      return new Response(JSON.stringify({ success: false, message: "JBU CTF 2026 has not started yet" }), {
+        status: 403,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    if (String(input).endsWith("/api/v1/users/me")) {
+      tokenVerified = true;
+      return new Response(JSON.stringify({ success: true, data: { id: 12, name: "tester" } }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    return new Response("not found", { status: 404 });
+  };
+  try {
+    const result = await fetchChallengesWithToken("https://ctf.example.com", "ctfd_token");
+    assert.equal(contentType, "application/json");
+    assert.equal(tokenVerified, true);
+    assert.deepEqual(result, { platform: "ctfd", challenges: [] });
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (oldPrivateHosts == null) delete process.env.CTF_ALLOW_PRIVATE_HOSTS;
+    else process.env.CTF_ALLOW_PRIVATE_HOSTS = oldPrivateHosts;
+  }
+});
+
+test("시작 전 CTFd에서 잘못된 토큰은 연결로 저장하지 않는다", async () => {
+  const originalFetch = globalThis.fetch;
+  const oldPrivateHosts = process.env.CTF_ALLOW_PRIVATE_HOSTS;
+  process.env.CTF_ALLOW_PRIVATE_HOSTS = "true";
+  globalThis.fetch = async (input) => {
+    if (String(input).endsWith("/api/v1/challenges")) {
+      return new Response(JSON.stringify({ success: false, message: "CTF has not started yet" }), {
+        status: 403,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    return new Response(JSON.stringify({ success: false, message: "Your access token is invalid" }), {
+      status: 401,
+      headers: { "content-type": "application/json" },
+    });
+  };
+  try {
+    await assert.rejects(
+      () => fetchChallengesWithToken("https://ctf.example.com", "bad_token"),
+      /HTTP_401/,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (oldPrivateHosts == null) delete process.env.CTF_ALLOW_PRIVATE_HOSTS;
+    else process.env.CTF_ALLOW_PRIVATE_HOSTS = oldPrivateHosts;
+  }
+});
+
+test("원격 API 오류 문구를 호출자에게 그대로 노출하지 않는다", async () => {
+  const originalFetch = globalThis.fetch;
+  const oldPrivateHosts = process.env.CTF_ALLOW_PRIVATE_HOSTS;
+  process.env.CTF_ALLOW_PRIVATE_HOSTS = "true";
+  globalThis.fetch = async () => new Response(
+    JSON.stringify({ success: false, message: "<@everyone>" }),
+    { status: 500, headers: { "content-type": "application/json" } },
+  );
+  try {
+    await assert.rejects(
+      () => fetchPublicChallenges("ctfd", "https://ctf.example.com"),
+      (error: Error) => error.message === "HTTP_500",
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (oldPrivateHosts == null) delete process.env.CTF_ALLOW_PRIVATE_HOSTS;
+    else process.env.CTF_ALLOW_PRIVATE_HOSTS = oldPrivateHosts;
+  }
+});
+
+test("시작 전 CTFd 자동 감시는 빈 문제 목록으로 대기한다", async () => {
+  const originalFetch = globalThis.fetch;
+  const oldPrivateHosts = process.env.CTF_ALLOW_PRIVATE_HOSTS;
+  process.env.CTF_ALLOW_PRIVATE_HOSTS = "true";
+  globalThis.fetch = async (input) => String(input).endsWith("/api/v1/users/me")
+    ? new Response(JSON.stringify({ success: true, data: { id: 12, name: "tester" } }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    })
+    : new Response(JSON.stringify({ success: false, message: "JBU CTF 2026 has not started yet" }), {
+      status: 403,
+      headers: { "content-type": "application/json" },
+    });
+  try {
+    const challenges = await fetchPublicChallenges("ctfd", "https://ctf.example.com", { type: "token", value: "ctfd_token" });
+    assert.deepEqual(challenges, []);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (oldPrivateHosts == null) delete process.env.CTF_ALLOW_PRIVATE_HOSTS;
+    else process.env.CTF_ALLOW_PRIVATE_HOSTS = oldPrivateHosts;
+  }
+});
+
 test("HTTP와 사설 대회 주소를 차단한다", async () => {
   const oldPrivateHosts = process.env.CTF_ALLOW_PRIVATE_HOSTS;
   const oldInsecureHosts = process.env.CTF_ALLOW_INSECURE_HTTP_HOSTS;

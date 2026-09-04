@@ -31,6 +31,16 @@ export interface RemoteContestSchedule {
 
 const USER_AGENT = "discord-ctf-bot/1.0 (read-only monitor)";
 
+class RemoteHttpError extends Error {
+  constructor(readonly status: number, readonly remoteMessage?: string) {
+    super(`HTTP_${status}`);
+  }
+}
+
+function isCtfdNotStarted(error: unknown): boolean {
+  return error instanceof RemoteHttpError && error.status === 403 && /not started/i.test(error.remoteMessage ?? "");
+}
+
 function allowPrivateHosts(): boolean {
   return process.env.CTF_ALLOW_PRIVATE_HOSTS?.trim().toLowerCase() === "true";
 }
@@ -116,15 +126,22 @@ async function safeFileFetch(url: string, init: RequestInit): Promise<Response> 
 
 async function safeJson(url: string, init: RequestInit = {}): Promise<any> {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 10_000);
+  const timeout = setTimeout(() => controller.abort(), 30_000);
   try {
     const response = await safeFetch(url, {
       ...init,
-      headers: { "User-Agent": USER_AGENT, Accept: "application/json", ...(init.headers ?? {}) },
+      headers: { "User-Agent": USER_AGENT, Accept: "application/json", "Content-Type": "application/json", ...(init.headers ?? {}) },
       signal: controller.signal,
     });
     if (response.status === 429) throw new Error("RATE_LIMITED");
-    if (!response.ok) throw new Error(`HTTP_${response.status}`);
+    if (!response.ok) {
+      let remoteMessage: string | undefined;
+      try {
+        const body = await response.json();
+        if (typeof body?.message === "string") remoteMessage = body.message;
+      } catch { /* 상태 코드만 사용 */ }
+      throw new RemoteHttpError(response.status, remoteMessage);
+    }
     return await response.json();
   } finally {
     clearTimeout(timeout);
@@ -133,7 +150,7 @@ async function safeJson(url: string, init: RequestInit = {}): Promise<any> {
 
 async function safeText(url: string, init: RequestInit = {}): Promise<string> {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 10_000);
+  const timeout = setTimeout(() => controller.abort(), 30_000);
   try {
     const response = await safeFetch(url, {
       ...init,
@@ -200,6 +217,13 @@ function authHeaders(platform: PlatformKind, auth?: ChallengeAuth): Record<strin
   if (platform === "rctf") return { Authorization: `Bearer ${auth.value}` };
   if (platform === "hspace") return { Cookie: `Access-Token=${auth.value}` };
   return undefined;
+}
+
+async function verifyCtfdAuth(base: string, auth?: ChallengeAuth): Promise<void> {
+  if (!auth) return;
+  const headers = authHeaders("ctfd", auth);
+  const json = await safeJson(`${base}/api/v1/users/me`, headers ? { headers } : undefined);
+  if (!json?.success || !json.data) throw new Error("CTFd 인증정보를 확인하지 못했습니다.");
 }
 
 function remoteTimestamp(value: unknown): number | undefined {
@@ -361,7 +385,15 @@ export async function fetchPublicChallenges(platform: PlatformKind, url: string,
   const auth = typeof authInput === "string" ? { type: "token" as const, value: authInput } : authInput;
   if (platform === "ctfd") {
     const headers = authHeaders(platform, auth);
-    const json = await safeJson(`${base}/api/v1/challenges`, headers ? { headers } : undefined);
+    let json;
+    try { json = await safeJson(`${base}/api/v1/challenges`, headers ? { headers } : undefined); }
+    catch (error) {
+      if (isCtfdNotStarted(error)) {
+        await verifyCtfdAuth(base, auth);
+        return [];
+      }
+      throw error;
+    }
     if (!json?.success || !Array.isArray(json.data)) throw new Error("CTFd 문제 목록 형식이 아닙니다.");
     return json.data.map((item: any) => mapCtfdChallenge(base, item)).filter((item: RemoteChallenge) => item.name);
   }
@@ -395,7 +427,13 @@ export async function fetchChallengesWithToken(url: string, token: string): Prom
     if (json?.success && Array.isArray(json.data)) {
       return { platform: "ctfd", challenges: json.data.map((item: any) => mapCtfdChallenge(base, item)).filter((item: RemoteChallenge) => item.name) };
     }
-  } catch { /* rCTF 확인 */ }
+  } catch (error) {
+    if (isCtfdNotStarted(error)) {
+      await verifyCtfdAuth(base, { type: "token", value: token });
+      return { platform: "ctfd", challenges: [] };
+    }
+    /* rCTF 확인 */
+  }
   const json = await safeJson(`${base}/api/v2/challs`, { headers: { Authorization: `Bearer ${token}` } });
   if (!Array.isArray(json?.data)) throw new Error("CTFd/rCTF 읽기 토큰으로 문제를 가져오지 못했습니다.");
   return { platform: "rctf", challenges: json.data.map((item: any) => ({ externalId: String(item.id), name: String(item.name ?? "").trim(), category: String(item.category ?? "misc").trim() })).filter((item: RemoteChallenge) => item.name) };
