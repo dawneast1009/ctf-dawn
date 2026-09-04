@@ -1,8 +1,8 @@
 import "dotenv/config";
-import { ActionRowBuilder, ButtonBuilder, ButtonStyle, ChannelType, Client, EmbedBuilder, Events, GatewayIntentBits, inlineCode, MessageFlags, ModalBuilder, PermissionFlagsBits, SlashCommandBuilder, StringSelectMenuBuilder, TextInputBuilder, TextInputStyle, ThreadAutoArchiveDuration, UserSelectMenuBuilder, type ButtonInteraction, type ChatInputCommandInteraction, type Guild, type GuildMember, type ModalSubmitInteraction, type TextChannel, type ThreadChannel, type UserSelectMenuInteraction } from "discord.js";
+import { ActionRowBuilder, AttachmentBuilder, ButtonBuilder, ButtonStyle, ChannelType, Client, EmbedBuilder, Events, GatewayIntentBits, inlineCode, MessageFlags, ModalBuilder, PermissionFlagsBits, SlashCommandBuilder, StringSelectMenuBuilder, TextInputBuilder, TextInputStyle, ThreadAutoArchiveDuration, UserSelectMenuBuilder, type ButtonInteraction, type ChatInputCommandInteraction, type Guild, type GuildMember, type ModalSubmitInteraction, type TextChannel, type ThreadChannel, type UserSelectMenuInteraction } from "discord.js";
 import { findProblem, findProblemByExternalId, getChannel, getContest, getContests, getMessage, getMessages, getProblem, getProblemByThread, getProblems, keyOf, patchContest, patchProblem, putChannel, putContest, putMessage, putProblem, removeContest, removeMessage, removeProblem, type CtfContest, type CtfProblem } from "./store";
-import { categoryChannelName, isAllSolved, normalizeCtfCategory, parseKstDateTime } from "./ctf/core";
-import { detectPlatform, fetchChallengesWithSession, fetchChallengesWithToken, fetchCtfdContestSchedule, fetchPublicChallenges, type ChallengeAuth, type RemoteChallenge } from "./ctf/platforms";
+import { appendRemoteAnnouncement, categoryChannelName, isAllSolved, normalizeCtfCategory, parseKstDateTime, remoteContentChanges, remoteSyncAnnouncement, selectChallengeDetailBatch, splitChallengeDescription } from "./ctf/core";
+import { detectPlatform, downloadRemoteChallengeFile, fetchChallengesWithSession, fetchChallengesWithToken, fetchCtfdChallengeDetailsBatch, fetchCtfdContestSchedule, fetchPublicChallenges, type ChallengeAuth, type RemoteChallenge } from "./ctf/platforms";
 import { decryptSecret, encryptSecret } from "./ctf/secrets";
 
 const token = process.env.DISCORD_TOKEN;
@@ -16,6 +16,7 @@ const deleteDrafts = new Map<string, { guildId: string; ctfKey: string; userId: 
 const pullDrafts = new Map<string, { guildId: string; ctfKey: string; userId: string; createdAt: number }>();
 const threadOpenings = new Map<string, Promise<ThreadChannel>>();
 const legacyStatusCleaned = new Set<string>();
+const challengeDetailCursors = new Map<string, number>();
 const id = () => `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`;
 const adminSubs = new Set(["create", "createchallenge", "edit", "delete", "deletechallenge", "addpoint", "deletepoint", "pull", "warning", "defaultsettings"]);
 
@@ -176,6 +177,86 @@ async function refreshChallengeCard(guild: Guild, problem: CtfProblem) {
     if (thread?.isThread() && thread.name !== expected) await thread.setName(expected);
   }
 }
+
+async function deleteRemoteMessages(guild: Guild, channelId: string, messageIds: string[]) {
+  if (!messageIds.length) return;
+  const remoteChannel = await guild.channels.fetch(channelId).catch(() => null);
+  if (remoteChannel?.type !== ChannelType.GuildText) return;
+  for (const messageId of messageIds) await remoteChannel.messages.delete(messageId).catch(() => undefined);
+}
+
+async function replaceRemoteDescription(guild: Guild, problem: CtfProblem, description: string) {
+  const target = await guild.channels.fetch(problem.channelId).catch(() => null);
+  if (target?.type !== ChannelType.GuildText) throw new Error("문제 분야 채널을 찾을 수 없습니다.");
+  const created: string[] = [];
+  try {
+    for (const [index, chunk] of splitChallengeDescription(description).entries()) {
+      const embed = new EmbedBuilder().setColor(0x5865f2).setDescription(chunk);
+      if (index === 0) embed.setTitle(`📖 ${problem.name} · 문제 설명`);
+      const message = await target.send({ embeds: [embed], allowedMentions: { parse: [] } });
+      created.push(message.id);
+    }
+  } catch (error) {
+    await deleteRemoteMessages(guild, problem.channelId, created);
+    throw error;
+  }
+  await deleteRemoteMessages(guild, problem.descriptionChannelId ?? problem.channelId, problem.descriptionMessageIds ?? []);
+  patchProblem(problem.id, { remoteDescription: description, descriptionMessageIds: created, descriptionChannelId: problem.channelId });
+}
+
+async function replaceRemoteFiles(guild: Guild, contest: CtfContest, problem: CtfProblem, remote: RemoteChallenge, auth?: ChallengeAuth) {
+  if (remote.files === undefined) return;
+  const target = await guild.channels.fetch(problem.channelId).catch(() => null);
+  if (target?.type !== ChannelType.GuildText) throw new Error("문제 분야 채널을 찾을 수 없습니다.");
+  const moved = problem.fileChannelId != null && problem.fileChannelId !== problem.channelId;
+  const previousMessages = problem.fileMessageIds ?? {};
+  const nextMessages: Record<string, string> = {};
+  const created: string[] = [];
+  try {
+    for (const file of remote.files) {
+      const unchanged = (problem.remoteFiles ?? []).some((old) => old.id === file.id && old.name === file.name);
+      if (!moved && unchanged && previousMessages[file.id]) {
+        nextMessages[file.id] = previousMessages[file.id];
+        continue;
+      }
+      let message;
+      try {
+        const downloaded = await downloadRemoteChallengeFile(contest.sourceUrl!, file, auth);
+        message = await target.send({ content: `📎 **${file.name}**`, files: [new AttachmentBuilder(downloaded.data, { name: downloaded.name })], allowedMentions: { parse: [] } });
+      } catch (error) {
+        if (!(error instanceof Error) || error.message !== "FILE_TOO_LARGE") throw error;
+        message = await target.send({ content: `📎 **${file.name}** · Discord 업로드 한도를 초과했습니다. CTFd 문제 페이지에서 직접 내려받으세요.`, allowedMentions: { parse: [] } });
+      }
+      created.push(message.id);
+      nextMessages[file.id] = message.id;
+    }
+  } catch (error) {
+    await deleteRemoteMessages(guild, problem.channelId, created);
+    throw error;
+  }
+  const retained = new Set(Object.values(nextMessages));
+  const obsolete = Object.values(previousMessages).filter((messageId) => !retained.has(messageId));
+  await deleteRemoteMessages(guild, problem.fileChannelId ?? problem.channelId, obsolete);
+  patchProblem(problem.id, {
+    remoteFiles: remote.files.map(({ id: fileId, name }) => ({ id: fileId, name })),
+    fileMessageIds: nextMessages,
+    fileChannelId: problem.channelId,
+  });
+}
+
+async function syncRemoteContent(guild: Guild, contest: CtfContest, problem: CtfProblem, remote: RemoteChallenge, auth?: ChallengeAuth) {
+  const descriptionMoved = problem.descriptionChannelId != null && problem.descriptionChannelId !== problem.channelId;
+  const filesMoved = problem.fileChannelId != null && problem.fileChannelId !== problem.channelId;
+  const changes = remoteContentChanges(
+    { description: problem.remoteDescription, files: problem.remoteFiles?.map((file) => ({ ...file, url: "" })) },
+    remote,
+  );
+  if (remote.description !== undefined && (descriptionMoved || problem.remoteDescription !== remote.description)) await replaceRemoteDescription(guild, problem, remote.description);
+  if (remote.files !== undefined && (filesMoved || changes.some((change) => change.startsWith("파일 ")))) {
+    await replaceRemoteFiles(guild, contest, getProblem(problem.id)!, remote, auth);
+  }
+  return changes;
+}
 async function ensureChallengeThread(guild: Guild, problemId: string): Promise<ThreadChannel> {
   const running = threadOpenings.get(problemId);
   if (running) return running;
@@ -246,14 +327,21 @@ async function status(guild: Guild, contest: CtfContest) {
 async function challenge(guild: Guild, c: CtfContest, category: string, name: string, externalId?: string, updateStatus = true) { if (findProblem(guild.id, c.key, name)) return; const genre = normalizeCtfCategory(category); const ch = await channel(guild, c, `genre:${genre}`, `⬜｜${genre}`); const problem: CtfProblem = { id: id(), guildId: guild.id, ctfName: c.name, ctfKey: c.key, name, nameKey: keyOf(name), genre, genreKey: genre, channelId: ch.id, authorId: client.user!.id, participants: [], scores: {}, solved: false, externalId, createdAt: Date.now() }; putProblem(problem); try { await ensureChallengeCard(guild, problem); } catch (error) { removeProblem(problem.id); throw error; } if (updateStatus) await status(guild, c); return getProblem(problem.id)!; }
 
 type RemoteSyncResult = "created" | "updated" | "unchanged";
-async function syncRemoteChallenge(guild: Guild, contest: CtfContest, remote: RemoteChallenge): Promise<RemoteSyncResult> {
+interface RemoteSyncOutcome { result: RemoteSyncResult; changes: string[]; problem?: CtfProblem; }
+async function syncRemoteChallenge(guild: Guild, contest: CtfContest, remote: RemoteChallenge, auth?: ChallengeAuth): Promise<RemoteSyncOutcome> {
   const existing = findProblemByExternalId(guild.id, contest.key, remote.externalId) ?? findProblem(guild.id, contest.key, remote.name);
   if (!existing) {
-    await challenge(guild, contest, remote.category, remote.name, remote.externalId, false);
-    return "created";
+    const created = await challenge(guild, contest, remote.category, remote.name, remote.externalId, false);
+    if (!created) return { result: "unchanged", changes: [] };
+    await syncRemoteContent(guild, contest, created, remote, auth);
+    return { result: "created", changes: ["새 문제"], problem: getProblem(created.id)! };
   }
   const patch: Partial<CtfProblem> = {};
-  if (existing.name !== remote.name) Object.assign(patch, { name: remote.name, nameKey: keyOf(remote.name) });
+  const changes: string[] = [];
+  if (existing.name !== remote.name) {
+    Object.assign(patch, { name: remote.name, nameKey: keyOf(remote.name) });
+    changes.push("문제명");
+  }
   if (existing.externalId !== remote.externalId) patch.externalId = remote.externalId;
   const remoteGenre = normalizeCtfCategory(remote.category);
   if (existing.genreKey !== remoteGenre && !existing.threadId) {
@@ -263,11 +351,20 @@ async function syncRemoteChallenge(guild: Guild, contest: CtfContest, remote: Re
     }
     const nextChannel = await channel(guild, contest, `genre:${remoteGenre}`, `⬜｜${remoteGenre}`);
     Object.assign(patch, { genre: remoteGenre, genreKey: remoteGenre, channelId: nextChannel.id, cardMessageId: undefined });
+    changes.push("문제 분야");
   }
-  if (!Object.keys(patch).length) return "unchanged";
-  patchProblem(existing.id, patch);
-  await refreshChallengeCard(guild, getProblem(existing.id)!);
-  return "updated";
+  if (Object.keys(patch).length) {
+    patchProblem(existing.id, patch);
+    await refreshChallengeCard(guild, getProblem(existing.id)!);
+  }
+  changes.push(...await syncRemoteContent(guild, contest, getProblem(existing.id)!, remote, auth));
+  const latest = getProblem(existing.id)!;
+  return changes.length ? { result: "updated", changes, problem: latest } : { result: "unchanged", changes: [], problem: latest };
+}
+
+async function hydrateCtfdChallenges(contest: CtfContest, challenges: RemoteChallenge[], auth: ChallengeAuth | undefined, selectedIds: Set<string>) {
+  if (contest.platform !== "ctfd" || !contest.sourceUrl) return { challenges, failedIds: [] as string[] };
+  return fetchCtfdChallengeDetailsBatch(contest.sourceUrl, challenges, selectedIds, auth);
 }
 
 client.once(Events.ClientReady, async () => { for (const g of client.guilds.cache.values()) if (!guildIds.length || guildIds.includes(g.id)) { await g.commands.set([command.toJSON()]); for (const c of getContests(g.id)) { const role = await g.roles.fetch(c.roleId).catch(() => null); const roleName = c.name.trim().slice(0, 100); if (role && role.name !== roleName) await role.setName(roleName).catch((error) => console.warn(`역할 이름 갱신 실패 (${c.name}):`, error)); await ensureContestAnnouncement(g, c); await ensureChallengeCards(g, c); await status(g, c); } } console.log(`DAWN online: ${client.user!.tag}`); });
@@ -283,7 +380,7 @@ async function handle(i: ChatInputCommandInteraction) { if (!i.guild) return; co
   if (sub === "leaderboard") { const totals = new Map<string, number>(); for (const p of getProblems(i.guild.id)) for (const [u, n] of Object.entries(p.scores)) totals.set(u, (totals.get(u) ?? 0) + n); return void await i.reply([...totals.entries()].sort((a,b)=>b[1]-a[1]).map(([u,n],x)=>`${x+1}. <@${u}> · ${n}`).join("\n") || "기록 없음"); }
   if (sub === "pull") { if (!c) return void await i.reply({ content: "CTF 공간 안에서 실행하세요.", flags: MessageFlags.Ephemeral }); const pullId=id(); pullDrafts.set(pullId,{guildId:i.guild.id,ctfKey:c.key,userId:i.user.id,createdAt:Date.now()}); const modal=new ModalBuilder().setCustomId(`ctf-pull:${pullId}`).setTitle("CTF 문제 가져오기").addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(new TextInputBuilder().setCustomId("url").setLabel("대회 주소").setPlaceholder("https://ctf.example.com").setStyle(TextInputStyle.Short).setRequired(true)),new ActionRowBuilder<TextInputBuilder>().addComponents(new TextInputBuilder().setCustomId("access-token").setLabel("API / Access Token (선택)").setStyle(TextInputStyle.Paragraph).setRequired(false)),new ActionRowBuilder<TextInputBuilder>().addComponents(new TextInputBuilder().setCustomId("session-cookie").setLabel("CTFd session 쿠키값 (선택)").setPlaceholder("session=... 또는 쿠키값만 입력").setStyle(TextInputStyle.Paragraph).setRequired(false))); return void await i.showModal(modal); }
   if (sub === "warning" && c) { patchContest(i.guild.id,c.key,{warningEnabled:i.options.getBoolean("enabled",true)}); return void await i.reply({content:"변경 완료",flags:MessageFlags.Ephemeral}); }
-  if (sub === "defaultsettings") return void await i.reply({content:"KST · Solve 1 · Contribute 0.5 · monitor 120s",flags:MessageFlags.Ephemeral});
+  if (sub === "defaultsettings") return void await i.reply({content:"KST · Solve 1 · Contribute 0.5 · monitor 10s",flags:MessageFlags.Ephemeral});
   if (["deletechallenge","addpoint","deletepoint"].includes(sub)) { const ps=getProblems(i.guild.id,c?.key); const menu=new StringSelectMenuBuilder().setCustomId(`${sub}:${i.options.getUser("user")?.id ?? ""}:${i.options.getString("type") ?? ""}`).setPlaceholder("문제 선택").addOptions(ps.slice(0,25).map(p=>({label:p.name,value:p.id}))); return void await i.reply({content:"문제를 선택하세요.",components:[new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(menu)],flags:MessageFlags.Ephemeral}); }
 }
 async function pullModal(i: ModalSubmitInteraction) {
@@ -326,16 +423,23 @@ async function pullModal(i: ModalSubmitInteraction) {
     const ongoing = endsAt > Date.now();
     const updatedContest = patchContest(i.guild.id, c.key, { startsAt, endsAt, platform, sourceUrl: url, publicApiReadable: ongoing, encryptedAccessToken: ongoing ? encryptedAccessToken : undefined, authenticationType: ongoing ? authenticationType : undefined, monitorError: undefined, monitorErrorAt: undefined })!;
     if (scheduleChanged) await ensureContestAnnouncement(i.guild, updatedContest);
+    let detailFailures = 0;
+    if (platform === "ctfd") {
+      const hydrated = await hydrateCtfdChallenges(updatedContest, list, auth, new Set(list.map((remote: RemoteChallenge) => remote.externalId)));
+      list = hydrated.challenges;
+      detailFailures = hydrated.failedIds.length;
+    }
     let added = 0, updated = 0;
     for (const remote of list) {
-      const result = await syncRemoteChallenge(i.guild, updatedContest, remote);
-      if (result === "created") added++;
-      else if (result === "updated") updated++;
+      const outcome = await syncRemoteChallenge(i.guild, updatedContest, remote, auth);
+      if (outcome.result === "created") added++;
+      else if (outcome.result === "updated") updated++;
     }
     if (added || updated) await status(i.guild, updatedContest);
     const scheduleMessage = schedule ? `\nCTFd 일정 자동 반영: <t:${Math.floor(startsAt / 1000)}:f> ~ <t:${Math.floor(endsAt / 1000)}:f>` : platform === "ctfd" ? "\nCTFd에서 일정을 찾지 못해 기존 일정을 유지했습니다." : "";
     const authMessage = authenticationSecret ? (ongoing ? `\n${authenticationType === "session" ? "세션 쿠키" : "토큰"}을 암호화해 이 대회의 자동 감시에 저장했습니다.` : `\n종료된 대회라 ${authenticationType === "session" ? "세션 쿠키" : "토큰"}은 저장하지 않았습니다.`) : "";
-    return void await i.editReply(`${list.length}개 확인 · ${added}개 추가 · ${updated}개 갱신${scheduleMessage}${authMessage}`);
+    const detailMessage = detailFailures ? `\n상세 조회 실패: ${detailFailures}개(기본 문제 정보는 반영됨)` : "";
+    return void await i.editReply(`${list.length}개 확인 · ${added}개 추가 · ${updated}개 갱신${scheduleMessage}${authMessage}${detailMessage}`);
   } catch (error) {
     return void await i.editReply(`Pull 실패: ${error instanceof Error ? error.message : "알 수 없는 오류"}`);
   }
@@ -400,7 +504,29 @@ async function button(i: ButtonInteraction) {
   if (i.customId.startsWith("solve-submit:")) return submitSolve(i, i.customId.slice(13));
   if (i.customId.startsWith("delete-contest:") && i.guild) { const confirmationId = i.customId.slice(15), draft = deleteDrafts.get(confirmationId); if (!draft || draft.guildId !== i.guild.id || draft.userId !== i.user.id || Date.now() - draft.createdAt > 300_000) return void await i.update({ content: "삭제 확인이 만료되었습니다. `/ctf delete`를 다시 실행하세요.", components: [] }); const c = getContest(i.guild.id, draft.ctfKey); deleteDrafts.delete(confirmationId); if (!c) return void await i.update({ content: "이미 삭제된 CTF입니다.", components: [] }); await i.update({ content: `**${c.name}** 삭제 중...`, components: [] }); try { await deleteContestWorkspace(i.guild, c); await i.editReply({ content: `**${c.name}** 삭제 완료`, components: [] }); } catch (error) { await i.editReply({ content: `삭제가 일부 완료되지 않았습니다: ${error instanceof Error ? error.message : "알 수 없는 오류"}`, components: [] }); } }
 }
-async function select(custom:string,pid:string,i:any){const [kind,user,amount]=custom.split(":");const p=getProblem(pid);if(!p)return;if(kind==="deletechallenge"){if(p.threadId)await i.guild.channels.delete(p.threadId).catch(()=>undefined);if(p.cardMessageId){const ch=await i.guild.channels.fetch(p.channelId).catch(()=>null);if(ch?.type===ChannelType.GuildText)await ch.messages.delete(p.cardMessageId).catch(()=>undefined);}removeProblem(pid);const genreChannel=await i.guild.channels.fetch(p.channelId).catch(()=>null);if(genreChannel?.type===ChannelType.GuildText)await genreChannel.setName(categoryChannelName(p.genreKey,getProblems(i.guild.id,p.ctfKey).filter(problem=>problem.genreKey===p.genreKey)));}else if(kind==="addpoint"){patchProblem(pid,{scores:{...p.scores,[user]:Number(amount)},solved:Number(amount)===1||p.solved});await refreshChallengeCard(i.guild,getProblem(pid)!);}else if(kind==="deletepoint"){const s={...p.scores};delete s[user];patchProblem(pid,{scores:s,solved:Object.values(s).some(n=>n>=1)});await refreshChallengeCard(i.guild,getProblem(pid)!);}await status(i.guild,getContest(i.guild.id,p.ctfKey));await i.update({content:"완료",components:[]});}
+async function select(custom:string,pid:string,i:any){
+  const [kind,user,amount]=custom.split(":");
+  const p=getProblem(pid);
+  if(!p)return;
+  if(kind==="deletechallenge"){
+    if(p.threadId)await i.guild.channels.delete(p.threadId).catch(()=>undefined);
+    if(p.cardMessageId){const ch=await i.guild.channels.fetch(p.channelId).catch(()=>null);if(ch?.type===ChannelType.GuildText)await ch.messages.delete(p.cardMessageId).catch(()=>undefined);}
+    await deleteRemoteMessages(i.guild, p.descriptionChannelId ?? p.channelId, p.descriptionMessageIds ?? []);
+    await deleteRemoteMessages(i.guild, p.fileChannelId ?? p.channelId, Object.values(p.fileMessageIds ?? {}));
+    removeProblem(pid);
+    const genreChannel=await i.guild.channels.fetch(p.channelId).catch(()=>null);
+    if(genreChannel?.type===ChannelType.GuildText)await genreChannel.setName(categoryChannelName(p.genreKey,getProblems(i.guild.id,p.ctfKey).filter(problem=>problem.genreKey===p.genreKey)));
+  }else if(kind==="addpoint"){
+    patchProblem(pid,{scores:{...p.scores,[user]:Number(amount)},solved:Number(amount)===1||p.solved});
+    await refreshChallengeCard(i.guild,getProblem(pid)!);
+  }else if(kind==="deletepoint"){
+    const s={...p.scores};delete s[user];
+    patchProblem(pid,{scores:s,solved:Object.values(s).some(n=>n>=1)});
+    await refreshChallengeCard(i.guild,getProblem(pid)!);
+  }
+  await status(i.guild,getContest(i.guild.id,p.ctfKey));
+  await i.update({content:"완료",components:[]});
+}
 let monitorRunning = false;
 async function notifyMonitorError(guild: Guild, contest: CtfContest, error: unknown) {
   const message = error instanceof Error ? error.message : "알 수 없는 오류";
@@ -408,6 +534,19 @@ async function notifyMonitorError(guild: Guild, contest: CtfContest, error: unkn
   const credentialChannel = await channel(guild, contest, "credential", "🔑｜credential");
   await credentialChannel.send(`⚠️ **${contest.name}** 문제 자동 감시에 실패했습니다.\n${message}\n인증이 만료됐다면 \`/ctf pull\`로 다시 입력하세요.`);
   patchContest(guild.id, contest.key, { monitorError: message, monitorErrorAt: Date.now() });
+}
+function queueRemoteAnnouncement(guildId: string, contest: CtfContest, message: string) {
+  patchContest(guildId, contest.key, { pendingRemoteAnnouncements: appendRemoteAnnouncement(contest.pendingRemoteAnnouncements, message) });
+}
+async function flushRemoteAnnouncements(guild: Guild, contest: CtfContest) {
+  let pending = getContest(guild.id, contest.key)?.pendingRemoteAnnouncements ?? [];
+  if (!pending.length) return;
+  const general = await channel(guild, contest, "general", "general");
+  while (pending.length) {
+    await general.send({ content: pending[0], allowedMentions: { parse: [] } });
+    pending = pending.slice(1);
+    patchContest(guild.id, contest.key, { pendingRemoteAnnouncements: pending });
+  }
 }
 async function monitorContests() {
   if (monitorRunning) return;
@@ -423,10 +562,29 @@ async function monitorContests() {
       try {
         const accessToken = contest.encryptedAccessToken ? decryptSecret(contest.encryptedAccessToken) : undefined;
         const auth: ChallengeAuth | undefined = accessToken ? { type: contest.authenticationType ?? "token", value: accessToken } : undefined;
+        let remotes = await fetchPublicChallenges(contest.platform, contest.sourceUrl, auth);
+        let detailFailures = 0;
+        if (contest.platform === "ctfd") {
+          const cursorKey = `${guild.id}:${contest.key}`;
+          const batch = selectChallengeDetailBatch(remotes.map((remote) => remote.externalId), challengeDetailCursors.get(cursorKey) ?? 0, 5);
+          challengeDetailCursors.set(cursorKey, batch.nextCursor);
+          const selected = new Set(batch.ids);
+          for (const remote of remotes) if (!findProblemByExternalId(guild.id, contest.key, remote.externalId)) selected.add(remote.externalId);
+          const hydrated = await hydrateCtfdChallenges(contest, remotes, auth, selected);
+          remotes = hydrated.challenges;
+          detailFailures = hydrated.failedIds.length;
+          if (detailFailures) await notifyMonitorError(guild, contest, new Error(`CTFd 문제 상세 ${detailFailures}개 조회 실패`));
+        }
         let changed = 0;
-        for (const remote of await fetchPublicChallenges(contest.platform, contest.sourceUrl, auth)) if (await syncRemoteChallenge(guild, contest, remote) !== "unchanged") changed++;
+        for (const remote of remotes) {
+          const outcome = await syncRemoteChallenge(guild, contest, remote, auth);
+          if (outcome.result === "unchanged" || !outcome.problem) continue;
+          changed++;
+          queueRemoteAnnouncement(guild.id, contest, remoteSyncAnnouncement(outcome.problem.name, outcome.problem.channelId, outcome.result, outcome.changes));
+        }
         if (changed) await status(guild, contest);
-        if (contest.monitorError) patchContest(guild.id, contest.key, { monitorError: undefined, monitorErrorAt: undefined });
+        await flushRemoteAnnouncements(guild, contest);
+        if (contest.monitorError && detailFailures === 0) patchContest(guild.id, contest.key, { monitorError: undefined, monitorErrorAt: undefined });
       } catch (error) {
         await notifyMonitorError(guild, contest, error).catch((notifyError) => console.error("감시 오류 알림 실패:", notifyError));
       }
@@ -435,5 +593,9 @@ async function monitorContests() {
     monitorRunning = false;
   }
 }
-setInterval(() => void monitorContests().catch((error) => console.error("자동 감시 실패:", error)), Math.max(60, Number(process.env.CTF_MONITOR_INTERVAL_SECONDS) || 120) * 1000).unref();
+const monitorIntervalSeconds = Math.max(
+  10,
+  Number(process.env.CTF_MONITOR_INTERVAL_SECONDS) || 10
+);
+setInterval(() => void monitorContests().catch((error) => console.error("자동 감시 실패:", error)), monitorIntervalSeconds * 1000).unref();
 client.login(token);

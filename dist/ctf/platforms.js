@@ -4,6 +4,9 @@ exports.assertSafeRemoteUrl = assertSafeRemoteUrl;
 exports.ctfdSessionCookieHeader = ctfdSessionCookieHeader;
 exports.parseCtfdSchedulePage = parseCtfdSchedulePage;
 exports.fetchCtfdContestSchedule = fetchCtfdContestSchedule;
+exports.fetchCtfdChallengeDetails = fetchCtfdChallengeDetails;
+exports.fetchCtfdChallengeDetailsBatch = fetchCtfdChallengeDetailsBatch;
+exports.downloadRemoteChallengeFile = downloadRemoteChallengeFile;
 exports.parseHspaceChallengePage = parseHspaceChallengePage;
 exports.detectPlatform = detectPlatform;
 exports.fetchPublicChallenges = fetchPublicChallenges;
@@ -15,6 +18,9 @@ const node_net_1 = require("node:net");
 const USER_AGENT = "discord-ctf-bot/1.0 (read-only monitor)";
 function allowPrivateHosts() {
     return process.env.CTF_ALLOW_PRIVATE_HOSTS?.trim().toLowerCase() === "true";
+}
+function insecureHttpHosts() {
+    return new Set((process.env.CTF_ALLOW_INSECURE_HTTP_HOSTS ?? "").split(",").map((host) => host.trim().toLowerCase()).filter(Boolean));
 }
 function isPrivateAddress(address) {
     const normalized = address.toLowerCase().replace(/^\[|\]$/g, "");
@@ -43,7 +49,8 @@ function parsedRemoteUrl(input) {
     catch {
         throw new Error("올바른 HTTPS 대회 주소를 입력하세요.");
     }
-    if (url.protocol !== "https:" || url.username || url.password)
+    const insecureHttpAllowed = url.protocol === "http:" && insecureHttpHosts().has(url.host.toLowerCase());
+    if ((url.protocol !== "https:" && !insecureHttpAllowed) || url.username || url.password)
         throw new Error("대회 주소는 사용자정보가 없는 HTTPS URL이어야 합니다.");
     if (!allowPrivateHosts() && isPrivateAddress(url.hostname))
         throw new Error("localhost와 사설 네트워크 주소는 사용할 수 없습니다.");
@@ -78,6 +85,27 @@ async function safeFetch(url, init) {
         const next = parsedRemoteUrl(new URL(location, current).toString());
         if (hasSensitiveHeaders && next.origin !== current.origin)
             throw new Error("AUTH_CROSS_ORIGIN_REDIRECT");
+        await response.body?.cancel();
+        current = next;
+    }
+    throw new Error("TOO_MANY_REDIRECTS");
+}
+async function safeFileFetch(url, init) {
+    let current = parsedRemoteUrl(url);
+    const requestHeaders = new Headers(init.headers);
+    for (let redirects = 0; redirects <= 4; redirects++) {
+        await assertSafeRemoteUrl(current.toString());
+        const response = await fetch(current, { ...init, headers: requestHeaders, redirect: "manual" });
+        if (![301, 302, 303, 307, 308].includes(response.status))
+            return response;
+        const location = response.headers.get("location");
+        if (!location)
+            throw new Error("REDIRECT_WITHOUT_LOCATION");
+        const next = parsedRemoteUrl(new URL(location, current).toString());
+        if (next.origin !== current.origin) {
+            requestHeaders.delete("authorization");
+            requestHeaders.delete("cookie");
+        }
         await response.body?.cancel();
         current = next;
     }
@@ -126,6 +154,35 @@ function baseUrl(input) {
     url.search = "";
     url.hash = "";
     return url.toString().replace(/\/+$/, "");
+}
+function ctfdFile(base, input) {
+    const record = input && typeof input === "object" ? input : undefined;
+    const location = typeof input === "string" ? input : typeof record?.location === "string" ? record.location : undefined;
+    if (!location)
+        return null;
+    let url;
+    try {
+        url = parsedRemoteUrl(new URL(location, `${base}/`).toString());
+    }
+    catch {
+        return null;
+    }
+    const pathName = decodeURIComponent(url.pathname.split("/").filter(Boolean).pop() ?? "challenge-file");
+    const name = typeof record?.name === "string" && record.name.trim() ? record.name.trim() : pathName;
+    const identity = typeof record?.sha1sum === "string" && record.sha1sum ? record.sha1sum : url.pathname;
+    return { id: identity, name, url: url.toString() };
+}
+function mapCtfdChallenge(base, item) {
+    const challenge = {
+        externalId: String(item.id),
+        name: String(item.name ?? "").trim(),
+        category: String(item.category ?? "misc").trim(),
+    };
+    if (typeof item.description === "string")
+        challenge.description = item.description;
+    if (Array.isArray(item.files))
+        challenge.files = item.files.map((file) => ctfdFile(base, file)).filter((file) => file !== null);
+    return challenge;
 }
 function ctfdSessionCookieHeader(input) {
     const value = input.trim();
@@ -197,6 +254,79 @@ async function fetchCtfdContestSchedule(url, auth) {
     const html = await safeText(baseUrl(url), headers ? { headers } : undefined);
     return parseCtfdSchedulePage(html);
 }
+async function fetchCtfdChallengeDetails(url, challengeId, auth) {
+    const base = baseUrl(url);
+    const headers = authHeaders("ctfd", auth);
+    const json = await safeJson(`${base}/api/v1/challenges/${encodeURIComponent(challengeId)}`, headers ? { headers } : undefined);
+    if (!json?.success || !json.data || Array.isArray(json.data))
+        throw new Error("CTFd 문제 상세 형식이 아닙니다.");
+    const challenge = mapCtfdChallenge(base, json.data);
+    if (!challenge.name)
+        throw new Error("CTFd 문제 상세 형식이 아닙니다.");
+    return challenge;
+}
+async function fetchCtfdChallengeDetailsBatch(url, challenges, selectedIds, auth) {
+    const hydrated = [];
+    const failedIds = [];
+    for (const challenge of challenges) {
+        if (!selectedIds.has(challenge.externalId)) {
+            hydrated.push(challenge);
+            continue;
+        }
+        try {
+            hydrated.push(await fetchCtfdChallengeDetails(url, challenge.externalId, auth));
+        }
+        catch {
+            hydrated.push(challenge);
+            failedIds.push(challenge.externalId);
+        }
+    }
+    return { challenges: hydrated, failedIds };
+}
+async function downloadRemoteChallengeFile(contestUrl, file, auth, maxBytes = 10 * 1024 * 1024) {
+    const source = parsedRemoteUrl(baseUrl(contestUrl));
+    const target = parsedRemoteUrl(file.url);
+    const headers = target.origin === source.origin ? authHeaders("ctfd", auth) : undefined;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 30_000);
+    try {
+        const response = await safeFileFetch(target.toString(), {
+            headers: { "User-Agent": USER_AGENT, Accept: "application/octet-stream", ...(headers ?? {}) },
+            signal: controller.signal,
+        });
+        if (response.status === 429)
+            throw new Error("RATE_LIMITED");
+        if (!response.ok)
+            throw new Error(`HTTP_${response.status}`);
+        const contentLength = Number(response.headers.get("content-length"));
+        if (Number.isFinite(contentLength) && contentLength > maxBytes) {
+            await response.body?.cancel();
+            throw new Error("FILE_TOO_LARGE");
+        }
+        const chunks = [];
+        let size = 0;
+        const reader = response.body?.getReader();
+        if (reader) {
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done)
+                    break;
+                size += value.byteLength;
+                if (size > maxBytes) {
+                    await reader.cancel();
+                    throw new Error("FILE_TOO_LARGE");
+                }
+                chunks.push(Buffer.from(value));
+            }
+        }
+        const data = Buffer.concat(chunks, size);
+        const name = file.name.replace(/[\\/\r\n\0]/g, "_").slice(0, 200) || "challenge-file";
+        return { name, data };
+    }
+    finally {
+        clearTimeout(timeout);
+    }
+}
 function hspaceCompetitionId(input) {
     try {
         const url = new URL(input);
@@ -253,11 +383,7 @@ async function fetchPublicChallenges(platform, url, authInput) {
         const json = await safeJson(`${base}/api/v1/challenges`, headers ? { headers } : undefined);
         if (!json?.success || !Array.isArray(json.data))
             throw new Error("CTFd 문제 목록 형식이 아닙니다.");
-        return json.data.map((item) => ({
-            externalId: String(item.id),
-            name: String(item.name ?? "").trim(),
-            category: String(item.category ?? "misc").trim(),
-        })).filter((item) => item.name);
+        return json.data.map((item) => mapCtfdChallenge(base, item)).filter((item) => item.name);
     }
     if (platform === "rctf") {
         const headers = authHeaders(platform, auth);
@@ -290,7 +416,7 @@ async function fetchChallengesWithToken(url, token) {
     try {
         const json = await safeJson(`${base}/api/v1/challenges`, { headers: { Authorization: `Token ${token}` } });
         if (json?.success && Array.isArray(json.data)) {
-            return { platform: "ctfd", challenges: json.data.map((item) => ({ externalId: String(item.id), name: String(item.name ?? "").trim(), category: String(item.category ?? "misc").trim() })).filter((item) => item.name) };
+            return { platform: "ctfd", challenges: json.data.map((item) => mapCtfdChallenge(base, item)).filter((item) => item.name) };
         }
     }
     catch { /* rCTF 확인 */ }
@@ -308,7 +434,7 @@ async function fetchChallengesWithSession(url, sessionCookie) {
             return {
                 platform: "ctfd",
                 challenges: json.data
-                    .map((item) => ({ externalId: String(item.id), name: String(item.name ?? "").trim(), category: String(item.category ?? "misc").trim() }))
+                    .map((item) => mapCtfdChallenge(base, item))
                     .filter((item) => item.name),
             };
         }

@@ -13,6 +13,7 @@ export interface CtfContest {
   sourceUrl?: string; publicApiReadable?: boolean; encryptedAccessToken?: string;
   authenticationType?: "token" | "session";
   monitorError?: string; monitorErrorAt?: number;
+  pendingRemoteAnnouncements?: string[];
   createdAt: number; updatedAt: number;
 }
 export interface CtfProblem {
@@ -20,7 +21,10 @@ export interface CtfProblem {
   nameKey: string; genre: string; genreKey: string; channelId: string; threadId?: string;
   cardMessageId?: string; participants?: string[]; authorId: string;
   scores: Record<string, number>; solved: boolean; submittedFlag?: string;
-  externalId?: string; createdAt: number;
+  externalId?: string; remoteDescription?: string;
+  remoteFiles?: Array<{ id: string; name: string }>;
+  descriptionMessageIds?: string[]; fileMessageIds?: Record<string, string>;
+  descriptionChannelId?: string; fileChannelId?: string; createdAt: number;
 }
 interface Db { contests: Record<string, CtfContest>; problems: Record<string, CtfProblem>; channels: Record<string, string>; messages: Record<string, string>; }
 const empty = (): Db => ({ contests: {}, problems: {}, channels: {}, messages: {} });

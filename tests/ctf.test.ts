@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { categoryChannelName, isAllSolved, normalizeCtfCategory, parseKstDateTime } from "../src/ctf/core";
-import { assertSafeRemoteUrl, ctfdSessionCookieHeader, detectPlatform, fetchChallengesWithSession, fetchChallengesWithToken, fetchPublicChallenges, parseCtfdSchedulePage, parseHspaceChallengePage } from "../src/ctf/platforms";
+import { appendRemoteAnnouncement, categoryChannelName, isAllSolved, normalizeCtfCategory, parseKstDateTime, remoteContentChanges, remoteSyncAnnouncement, selectChallengeDetailBatch, splitChallengeDescription } from "../src/ctf/core";
+import { assertSafeRemoteUrl, ctfdSessionCookieHeader, detectPlatform, downloadRemoteChallengeFile, fetchChallengesWithSession, fetchChallengesWithToken, fetchCtfdChallengeDetails, fetchCtfdChallengeDetailsBatch, fetchPublicChallenges, parseCtfdSchedulePage, parseHspaceChallengePage } from "../src/ctf/platforms";
 import { decryptSecret, encryptSecret } from "../src/ctf/secrets";
 
 test("CTF 문제 분야를 소문자 채널명으로 정규화한다", () => {
@@ -79,6 +79,187 @@ test("CTFd session 쿠키 인증으로 문제를 가져온다", async () => {
   }
 });
 
+test("CTFd 문제 설명과 파일 정보를 손실하지 않는다", async () => {
+  const originalFetch = globalThis.fetch;
+  const oldPrivateHosts = process.env.CTF_ALLOW_PRIVATE_HOSTS;
+  process.env.CTF_ALLOW_PRIVATE_HOSTS = "true";
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    success: true,
+    data: [{
+      id: 7,
+      name: "Welcome",
+      category: "misc",
+      description: "설명 **전체**",
+      files: ["/files/abc123/challenge.zip?token=signed"],
+    }],
+  }), { status: 200, headers: { "content-type": "application/json" } });
+  try {
+    const challenges = await fetchPublicChallenges("ctfd", "https://ctf.example.com");
+    assert.deepEqual(challenges, [{
+      externalId: "7",
+      name: "Welcome",
+      category: "misc",
+      description: "설명 **전체**",
+      files: [{ id: "/files/abc123/challenge.zip", name: "challenge.zip", url: "https://ctf.example.com/files/abc123/challenge.zip?token=signed" }],
+    }]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (oldPrivateHosts == null) delete process.env.CTF_ALLOW_PRIVATE_HOSTS;
+    else process.env.CTF_ALLOW_PRIVATE_HOSTS = oldPrivateHosts;
+  }
+});
+
+test("긴 문제 설명을 빠짐없이 Discord 크기로 나눈다", () => {
+  const description = `${"가".repeat(4090)}\n${"나".repeat(30)}`;
+  const chunks = splitChallengeDescription(description);
+  assert.ok(Array.isArray(chunks));
+  assert.equal(chunks.join(""), description);
+  assert.equal(chunks.every((chunk: string) => chunk.length <= 4096), true);
+  const emojiChunks = splitChallengeDescription(`${"a".repeat(4095)}😀`);
+  assert.equal(/[\uD800-\uDBFF]$/.test(emojiChunks[0]), false);
+  assert.equal(emojiChunks.join(""), `${"a".repeat(4095)}😀`);
+});
+
+test("설명과 파일의 추가 교체 삭제를 구분한다", () => {
+  const changes = remoteContentChanges(
+    {
+      description: "이전 설명",
+      files: [
+        { id: "/files/old/challenge.zip", name: "challenge.zip", url: "https://ctf.example.com/files/old/challenge.zip?token=one" },
+        { id: "/files/old/old.txt", name: "old.txt", url: "https://ctf.example.com/files/old/old.txt" },
+      ],
+    },
+    {
+      description: "새 설명",
+      files: [
+        { id: "/files/new/challenge.zip", name: "challenge.zip", url: "https://ctf.example.com/files/new/challenge.zip?token=two" },
+        { id: "/files/new/readme.txt", name: "readme.txt", url: "https://ctf.example.com/files/new/readme.txt" },
+      ],
+    },
+  );
+  assert.deepEqual(changes, ["문제 설명", "파일 교체: challenge.zip", "파일 추가: readme.txt", "파일 삭제: old.txt"]);
+});
+
+test("이름이 같은 여러 파일도 개별 변경으로 추적한다", () => {
+  assert.deepEqual(remoteContentChanges(
+    { files: [{ id: "a", name: "source.zip", url: "" }, { id: "b", name: "source.zip", url: "" }] },
+    { files: [{ id: "a", name: "source.zip", url: "" }] },
+  ), ["파일 삭제: source.zip"]);
+  assert.deepEqual(remoteContentChanges(
+    { files: [{ id: "same-id", name: "old.zip", url: "" }] },
+    { files: [{ id: "same-id", name: "new.zip", url: "" }] },
+  ), ["파일 이름 변경: old.zip → new.zip"]);
+});
+
+test("CTFd 상세 점검은 순환 배치로 모든 문제를 빠짐없이 선택한다", () => {
+  assert.deepEqual(selectChallengeDetailBatch(["1", "2", "3"], 2, 2), { ids: ["3", "1"], nextCursor: 1 });
+  assert.deepEqual(selectChallengeDetailBatch(["1"], 9, 5), { ids: ["1"], nextCursor: 0 });
+});
+
+test("신규 문제와 변경 내역을 general 공지로 만든다", () => {
+  assert.equal(remoteSyncAnnouncement("Welcome", "123", "created", []), "🆕 새 문제 **Welcome** · <#123>");
+  assert.equal(remoteSyncAnnouncement("Welcome", "123", "updated", ["문제 설명", "파일 추가: source.zip"]), "🔄 문제 업데이트 **Welcome** · 문제 설명, 파일 추가: source.zip · <#123>");
+  const bounded = remoteSyncAnnouncement("Welcome", "123", "updated", Array.from({ length: 100 }, (_, index) => `파일 추가: ${"x".repeat(100)}-${index}.zip`));
+  assert.equal(bounded.length <= 2000, true);
+  assert.match(bounded, /외 \d+건/);
+});
+
+test("전송 대기 공지는 중복 없이 보존한다", () => {
+  assert.deepEqual(appendRemoteAnnouncement(undefined, "첫 공지"), ["첫 공지"]);
+  assert.deepEqual(appendRemoteAnnouncement(["첫 공지"], "둘째 공지"), ["첫 공지", "둘째 공지"]);
+  assert.deepEqual(appendRemoteAnnouncement(["첫 공지"], "첫 공지"), ["첫 공지"]);
+});
+
+test("CTFd 문제 상세를 인증 상태로 조회한다", async () => {
+  const originalFetch = globalThis.fetch;
+  const oldPrivateHosts = process.env.CTF_ALLOW_PRIVATE_HOSTS;
+  process.env.CTF_ALLOW_PRIVATE_HOSTS = "true";
+  let requestedUrl = "";
+  let cookie = "";
+  globalThis.fetch = async (input, init) => {
+    requestedUrl = String(input);
+    cookie = new Headers(init?.headers).get("cookie") ?? "";
+    return new Response(JSON.stringify({ success: true, data: { id: 9, name: "Detail", category: "web", description: "전문", files: ["/files/hash/source.py"] } }), { status: 200 });
+  };
+  try {
+    const detail = await fetchCtfdChallengeDetails("https://ctf.example.com", "9", { type: "session", value: "cookie-value" });
+    assert.equal(requestedUrl, "https://ctf.example.com/api/v1/challenges/9");
+    assert.equal(cookie, "session=cookie-value");
+    assert.equal(detail.description, "전문");
+    assert.equal(detail.files[0].name, "source.py");
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (oldPrivateHosts == null) delete process.env.CTF_ALLOW_PRIVATE_HOSTS;
+    else process.env.CTF_ALLOW_PRIVATE_HOSTS = oldPrivateHosts;
+  }
+});
+
+test("일부 CTFd 상세 조회가 실패해도 나머지 문제는 동기화한다", async () => {
+  const originalFetch = globalThis.fetch;
+  const oldPrivateHosts = process.env.CTF_ALLOW_PRIVATE_HOSTS;
+  process.env.CTF_ALLOW_PRIVATE_HOSTS = "true";
+  globalThis.fetch = async (input) => {
+    const id = String(input).split("/").pop();
+    if (id === "1") return new Response("error", { status: 500 });
+    return new Response(JSON.stringify({ success: true, data: { id: 2, name: "둘", category: "web", description: "상세" } }), { status: 200 });
+  };
+  try {
+    const result = await fetchCtfdChallengeDetailsBatch(
+      "https://ctf.example.com",
+      [{ externalId: "1", name: "하나", category: "misc" }, { externalId: "2", name: "둘", category: "web" }],
+      new Set(["1", "2"]),
+    );
+    assert.deepEqual(result.challenges, [{ externalId: "1", name: "하나", category: "misc" }, { externalId: "2", name: "둘", category: "web", description: "상세" }]);
+    assert.deepEqual(result.failedIds, ["1"]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (oldPrivateHosts == null) delete process.env.CTF_ALLOW_PRIVATE_HOSTS;
+    else process.env.CTF_ALLOW_PRIVATE_HOSTS = oldPrivateHosts;
+  }
+});
+
+test("CTFd 문제 파일은 같은 origin에만 인증을 보내 다운로드한다", async () => {
+  const originalFetch = globalThis.fetch;
+  const oldPrivateHosts = process.env.CTF_ALLOW_PRIVATE_HOSTS;
+  process.env.CTF_ALLOW_PRIVATE_HOSTS = "true";
+  let authorization = "";
+  globalThis.fetch = async (_input, init) => {
+    authorization = new Headers(init?.headers).get("authorization") ?? "";
+    return new Response(new Uint8Array([1, 2, 3]), { status: 200, headers: { "content-length": "3" } });
+  };
+  try {
+    const result = await downloadRemoteChallengeFile(
+      "https://ctf.example.com",
+      { id: "/files/hash/challenge.zip", name: "challenge.zip", url: "https://ctf.example.com/files/hash/challenge.zip" },
+      { type: "token", value: "api-token" },
+    );
+    assert.equal(authorization, "Token api-token");
+    assert.equal(result.name, "challenge.zip");
+    assert.deepEqual([...result.data], [1, 2, 3]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (oldPrivateHosts == null) delete process.env.CTF_ALLOW_PRIVATE_HOSTS;
+    else process.env.CTF_ALLOW_PRIVATE_HOSTS = oldPrivateHosts;
+  }
+});
+
+test("Discord 한도보다 큰 문제 파일은 다운로드 전에 거부한다", async () => {
+  const originalFetch = globalThis.fetch;
+  const oldPrivateHosts = process.env.CTF_ALLOW_PRIVATE_HOSTS;
+  process.env.CTF_ALLOW_PRIVATE_HOSTS = "true";
+  globalThis.fetch = async () => new Response(new Uint8Array(), { status: 200, headers: { "content-length": String(10 * 1024 * 1024 + 1) } });
+  try {
+    await assert.rejects(
+      () => downloadRemoteChallengeFile("https://ctf.example.com", { id: "large", name: "large.zip", url: "https://cdn.example.com/large.zip" }),
+      /FILE_TOO_LARGE/,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (oldPrivateHosts == null) delete process.env.CTF_ALLOW_PRIVATE_HOSTS;
+    else process.env.CTF_ALLOW_PRIVATE_HOSTS = oldPrivateHosts;
+  }
+});
+
 test("기존 CTFd API 토큰 인증을 유지한다", async () => {
   const originalFetch = globalThis.fetch;
   const oldPrivateHosts = process.env.CTF_ALLOW_PRIVATE_HOSTS;
@@ -102,7 +283,9 @@ test("기존 CTFd API 토큰 인증을 유지한다", async () => {
 
 test("HTTP와 사설 대회 주소를 차단한다", async () => {
   const oldPrivateHosts = process.env.CTF_ALLOW_PRIVATE_HOSTS;
+  const oldInsecureHosts = process.env.CTF_ALLOW_INSECURE_HTTP_HOSTS;
   process.env.CTF_ALLOW_PRIVATE_HOSTS = "false";
+  delete process.env.CTF_ALLOW_INSECURE_HTTP_HOSTS;
   try {
     await assert.rejects(() => assertSafeRemoteUrl("http://ctf.example.com"), /HTTPS/);
     await assert.rejects(() => assertSafeRemoteUrl("https://127.0.0.1:8000"), /사설 네트워크|localhost/);
@@ -110,6 +293,36 @@ test("HTTP와 사설 대회 주소를 차단한다", async () => {
   } finally {
     if (oldPrivateHosts == null) delete process.env.CTF_ALLOW_PRIVATE_HOSTS;
     else process.env.CTF_ALLOW_PRIVATE_HOSTS = oldPrivateHosts;
+    if (oldInsecureHosts == null) delete process.env.CTF_ALLOW_INSECURE_HTTP_HOSTS;
+    else process.env.CTF_ALLOW_INSECURE_HTTP_HOSTS = oldInsecureHosts;
+  }
+});
+
+test("명시적으로 허용한 CTFd 호스트에만 HTTP 인증 요청을 보낸다", async () => {
+  const originalFetch = globalThis.fetch;
+  const oldPrivateHosts = process.env.CTF_ALLOW_PRIVATE_HOSTS;
+  const oldInsecureHosts = process.env.CTF_ALLOW_INSECURE_HTTP_HOSTS;
+  process.env.CTF_ALLOW_PRIVATE_HOSTS = "true";
+  process.env.CTF_ALLOW_INSECURE_HTTP_HOSTS = "jbuctf.kr";
+  let requestedUrl = "";
+  let authorization = "";
+  globalThis.fetch = async (input, init) => {
+    requestedUrl = String(input);
+    authorization = new Headers(init?.headers).get("authorization") ?? "";
+    return new Response(JSON.stringify({ success: true, data: [{ id: 1, name: "HTTP Challenge", category: "web", files: ["/files/hash/source.zip"] }] }), { status: 200 });
+  };
+  try {
+    const challenges = await fetchPublicChallenges("ctfd", "http://jbuctf.kr", { type: "token", value: "api-token" });
+    assert.equal(requestedUrl, "http://jbuctf.kr/api/v1/challenges");
+    assert.equal(authorization, "Token api-token");
+    assert.equal(challenges[0].files?.[0].url, "http://jbuctf.kr/files/hash/source.zip");
+    await assert.rejects(() => fetchPublicChallenges("ctfd", "http://other.example.com", { type: "token", value: "api-token" }), /HTTPS/);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (oldPrivateHosts == null) delete process.env.CTF_ALLOW_PRIVATE_HOSTS;
+    else process.env.CTF_ALLOW_PRIVATE_HOSTS = oldPrivateHosts;
+    if (oldInsecureHosts == null) delete process.env.CTF_ALLOW_INSECURE_HTTP_HOSTS;
+    else process.env.CTF_ALLOW_INSECURE_HTTP_HOSTS = oldInsecureHosts;
   }
 });
 

@@ -14,12 +14,14 @@
 - 분야별 문제를 모두 풀면 채널 표시가 `⬜`에서 `🟦`로 변경되고 새 문제가 추가되면 `⬜`로 복귀
 - `/ctf delete`: 확인 후 현재 CTF 공간, 참가 역할, 문제와 점수 기록 삭제
 - 프로필, 기록, 리더보드, 점수 보정, 문제 수정·삭제
-- CTFd/rCTF와 HSPACE FORGE 문제 Pull 및 저부하 신규 문제 감시
+- CTFd/rCTF와 HSPACE FORGE 문제 Pull 및 10초 간격 신규 문제 감시
 - CTFd Pull 시 대회 페이지의 시작·종료 일정을 자동 반영하고 공용 알림 갱신
+- CTFd 문제 설명 전체 게시, 첨부파일 업로드 및 변경 시 자동 교체와 `general` 공지
 - 외부 문제 ID 기준 이름·분야 갱신, 중복 감시 방지, 인증 만료 알림
 
 DAWN은 외부 대회에 플래그를 제출하지 않습니다. 공개 API 또는 대회 페이지 GET 요청만 사용하며
-기본 120초 간격으로 순차 조회합니다. 로그인 대회는 `/ctf pull`의 개인 입력 창에서
+기본 10초 간격으로 순차 조회합니다. CTFd 상세 정보는 한 주기당 최대 5개 문제를
+순환 조회하고 신규 문제는 즉시 조회해 요청 폭증을 막습니다. 로그인 대회는 `/ctf pull`의 개인 입력 창에서
 CTFd API 토큰 또는 로그인 후 브라우저의 `session` 쿠키값을 받습니다. rCTF API 토큰과
 HSPACE Access-Token도 기존처럼 지원합니다. 인증정보는 AES-256-GCM으로 암호화해
 대회별 자동 감시에 저장합니다. 인증정보가 만료되면 Pull로 새 값을 입력하며, 대회
@@ -40,6 +42,12 @@ Pull 주소는 기본적으로 공개 HTTPS 호스트만 허용합니다. 일반
 세션 쿠키 인증에는 영향이 없습니다. 내부망 HTTPS CTFd가 꼭 필요할 때만 신뢰할 수 있는
 환경에서 `CTF_ALLOW_PRIVATE_HOSTS=true`를 설정하세요.
 
+HTTPS를 제공하지 않는 특정 대회 호스트는 쉼표로 구분해
+`CTF_ALLOW_INSECURE_HTTP_HOSTS=jbuctf.kr`처럼 명시적으로 허용할 수 있습니다. 이 예외는
+정확히 일치하는 호스트에만 적용되며 다른 HTTP 주소는 계속 차단됩니다. HTTP에서는 API
+토큰과 session 쿠키가 네트워크에 평문으로 노출될 수 있으므로 위험을 수용한 경우에만
+사용하세요.
+
 ## 실행
 
 Node.js 22를 권장합니다.
@@ -54,7 +62,7 @@ npm start
 Docker에서는 `/app/data`를 영구 볼륨으로 마운트해야 재배포 후 기록이 유지됩니다.
 
 필수 Discord scope는 `bot`, `applications.commands`입니다. 봇에는 View Channels,
-Send Messages, Embed Links, Read Message History, Manage Channels, Manage Roles,
+Send Messages, Embed Links, Attach Files, Read Message History, Manage Channels, Manage Roles,
 Create Private Threads, Send Messages in Threads, Manage Threads 권한을 부여합니다.
 DAWN 역할은 봇이 만드는 `대회명` 역할보다 위에 있어야 합니다. 기존 `CTF: 대회명`
 역할도 봇이 다시 시작되면 `대회명`으로 변경됩니다.
